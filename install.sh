@@ -137,24 +137,37 @@ def members(cred, target):
     except Exception as e:
         fail('AD computer query failed: %s' % e)
 
+    def dns_name(c):
+        for k, v in c.items():
+            if k.lower() == 'ds_dnshostname':
+                return str(v or '').lower().rstrip('.')
+        return ''
+
+    # The DNS WMI provider only answers record queries scoped to one zone,
+    # so ask each zone the computers live in (e.g. "mamba.dc").
+    zones = sorted({dns_name(c).split('.', 1)[1] for c in computers if '.' in dns_name(c)})
     ips = {}
-    try:
-        records = query(cred, target, '-key', 'OwnerName', '-namespace', '//./root/MicrosoftDNS',
-                        '-fields', 'OwnerName,IPAddress', 'MicrosoftDNS_AType')
+    for zone in zones:
+        records, last_error = None, None
+        for prop in ('ContainerName', 'DomainName'):
+            try:
+                records = query(cred, target, '-key', 'OwnerName', '-namespace', '//./root/MicrosoftDNS',
+                                '-fields', 'OwnerName,IPAddress', '-filter', "%s='%s'" % (prop, zone),
+                                'MicrosoftDNS_AType')
+                break
+            except Exception as e:
+                last_error = e
+        if records is None:
+            sys.stderr.write('DNS lookup on the DC failed for zone %s: %s\n' % (zone, last_error))
+            continue
         for r in records:
             name = str(r.get('OwnerName') or '').lower().rstrip('.')
             ip = str(r.get('IPAddress') or '')
             if name and ip and not ip.startswith('169.254.') and name not in ips:
                 ips[name] = ip
-    except Exception as e:
-        sys.stderr.write('DNS lookup on the DC failed: %s\n' % e)
 
     for c in computers:
-        dns = ''
-        for k, v in c.items():
-            if k.lower() == 'ds_dnshostname':
-                dns = str(v or '').lower().rstrip('.')
-        c['IPAddress'] = ips.get(dns, '')
+        c['IPAddress'] = ips.get(dns_name(c), '')
     print(json.dumps(computers))
     return 0
 
