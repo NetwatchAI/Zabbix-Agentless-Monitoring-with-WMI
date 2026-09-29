@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
 # install.sh - one-shot setup of agentless Windows/AD monitoring on an Ubuntu
-# Zabbix server: zbxwmi, zbxwmi-auth, fping, and (optionally) the template.
+# Netwatch agentless WMI setup: installs zbxwmi, zbxwmi-auth, fping, and (optionally) the template.
 #
 # Repo: https://github.com/mzozo22/Zabbix-Agentless-Monitoring-with-WMI
 #
@@ -253,7 +253,7 @@ else
   step "Skipping template import (ZBX_URL / ZBX_TOKEN not set): import it in the web interface"
 fi
 
-printf '\n\033[1;32mDone.\033[0m This Zabbix server is ready for agentless Windows/AD monitoring.\n\n'
+printf '\n\033[1;32mDone.\033[0m This server is ready for Netwatch agentless Windows/AD monitoring.\n\n'
 printf 'Test against a client DC:\n'
 printf "  sudo -u zabbix %s/zbxwmi-auth <admin-user> '<password>' <DOMAIN> -action get -fields Caption Win32_OperatingSystem <DC-IP>\n\n" "$DIR"
 printf 'Then onboard the client in the Zabbix web interface (guide, Part 3).\n'
