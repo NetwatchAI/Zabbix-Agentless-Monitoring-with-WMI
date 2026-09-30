@@ -3,14 +3,6 @@
 # install.sh - one-shot setup of agentless Windows/AD monitoring on an Ubuntu
 # Netwatch agentless WMI setup: installs zbxwmi, zbxwmi-auth, fping, and (optionally) the template.
 #
-# Repo: https://github.com/mzozo22/Zabbix-Agentless-Monitoring-with-WMI
-#
-# Install:
-#   curl -fsSL https://raw.githubusercontent.com/mzozo22/Zabbix-Agentless-Monitoring-with-WMI/main/install.sh | sudo bash
-#
-# Install and import/update the template through the Zabbix API:
-#   curl -fsSL https://raw.githubusercontent.com/mzozo22/Zabbix-Agentless-Monitoring-with-WMI/main/install.sh | \
-#     sudo ZBX_URL=http://<zabbix-server>/zabbix ZBX_TOKEN=<api-token> bash
 #
 # Safe to run again: it updates what is there and skips what is done.
 # ---------------------------------------------------------------------------
