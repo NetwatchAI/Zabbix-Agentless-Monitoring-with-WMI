@@ -10,7 +10,9 @@ set -euo pipefail
 
 ZBX_URL="${ZBX_URL:-}"             # URL you open Zabbix with, e.g. http://10.0.0.5/zabbix
 ZBX_TOKEN="${ZBX_TOKEN:-}"         # Zabbix API token (Users > API tokens)
-REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/mzozo22/Zabbix-Agentless-Monitoring-with-WMI/main}"
+ORG_REPO="${ORG_REPO:-https://github.com/NetwatchAI/Zabbix-Agentless-Monitoring-with-WMI}"
+REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/NetwatchAI/Zabbix-Agentless-Monitoring-with-WMI/main}"
+ZBXWMI_REPO="${ZBXWMI_REPO:-https://github.com/13hakta/zbxwmi.git}"
 TEMPLATE_FILE="${TEMPLATE_FILE:-}" # or a local path to the template JSON
 CONF="${ZABBIX_CONF:-/etc/zabbix/zabbix_server.conf}"
 
@@ -55,7 +57,7 @@ if [ -d /opt/zbxwmi/.git ]; then
   git -C /opt/zbxwmi pull -q
 else
   rm -rf /opt/zbxwmi
-  git clone -q https://github.com/13hakta/zbxwmi.git /opt/zbxwmi
+  git clone -q "$ZBXWMI_REPO" /opt/zbxwmi
 fi
 install -o zabbix -g zabbix -m 755 /opt/zbxwmi/zbxwmi "$DIR/zbxwmi"
 sed -i 's/\r$//' "$DIR/zbxwmi"
