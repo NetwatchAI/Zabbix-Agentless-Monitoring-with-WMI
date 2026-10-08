@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
 # install.sh - one-shot setup of agentless Windows/AD monitoring on an Ubuntu
-# Netwatch agentless WMI setup: installs zbxwmi, zbxwmi-auth, fping, and (optionally) the template.
+# Netwatch agentless WMI setup: installs ntwwmi, ntwwmi-auth, fping, and (optionally) the template.
 #
+# Repo: set your own; pass REPO_RAW or edit the default below
+#
+# Install:
+#   curl -fsSL https://<your-repo>/install.sh | sudo bash
+#
+# Install and import/update the template through the Zabbix API (Zabbix is the engine underneath):
+#   curl -fsSL https://<your-repo>/install.sh | \
+#     sudo ZBX_URL=http://<zabbix-server>/zabbix ZBX_TOKEN=<api-token> bash
 #
 # Safe to run again: it updates what is there and skips what is done.
 # ---------------------------------------------------------------------------
@@ -10,9 +18,7 @@ set -euo pipefail
 
 ZBX_URL="${ZBX_URL:-}"             # URL you open Zabbix with, e.g. http://10.0.0.5/zabbix
 ZBX_TOKEN="${ZBX_TOKEN:-}"         # Zabbix API token (Users > API tokens)
-ORG_REPO="${ORG_REPO:-https://github.com/NetwatchAI/Zabbix-Agentless-Monitoring-with-WMI}"
-REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/NetwatchAI/Zabbix-Agentless-Monitoring-with-WMI/main}"
-ZBXWMI_REPO="${ZBXWMI_REPO:-https://github.com/13hakta/zbxwmi.git}"
+REPO_RAW="${REPO_RAW:-https://<your-repo>}"
 TEMPLATE_FILE="${TEMPLATE_FILE:-}" # or a local path to the template JSON
 CONF="${ZABBIX_CONF:-/etc/zabbix/zabbix_server.conf}"
 
@@ -52,38 +58,38 @@ if [ ! -e /usr/sbin/fping ] && [ -x /usr/bin/fping ]; then
   ok "linked /usr/sbin/fping -> /usr/bin/fping"
 fi
 
-step "Installing zbxwmi"
+step "Installing ntwwmi (WMI connector)"
 if [ -d /opt/zbxwmi/.git ]; then
   git -C /opt/zbxwmi pull -q
 else
   rm -rf /opt/zbxwmi
-  git clone -q "$ZBXWMI_REPO" /opt/zbxwmi
+  git clone -q https://github.com/13hakta/zbxwmi.git /opt/zbxwmi
 fi
-install -o zabbix -g zabbix -m 755 /opt/zbxwmi/zbxwmi "$DIR/zbxwmi"
-sed -i 's/\r$//' "$DIR/zbxwmi"
-ok "$DIR/zbxwmi"
+install -o zabbix -g zabbix -m 755 /opt/zbxwmi/zbxwmi "$DIR/ntwwmi"
+sed -i 's/\r$//' "$DIR/ntwwmi"
+ok "$DIR/ntwwmi"
 
-step "Installing zbxwmi-auth"
-cat > "$DIR/zbxwmi-auth" <<'ZBXWMI_AUTH_EOF'
+step "Installing ntwwmi-auth (credential wrapper)"
+cat > "$DIR/ntwwmi-auth" <<'NTWWMI_AUTH_EOF'
 #!/usr/bin/env python3
 """
-zbxwmi-auth - credential wrapper for zbxwmi, used as a Zabbix external check.
+ntwwmi-auth - credential wrapper for ntwwmi, the Netwatch WMI connector.
 
 Lets each host carry its own WMI credentials in user macros instead of a
-credential file on the Zabbix server. Install once, next to zbxwmi:
+credential file on the server. Install once, next to ntwwmi:
 
-  sudo cp zbxwmi-auth /usr/lib/zabbix/externalscripts/
-  sudo chown zabbix:zabbix /usr/lib/zabbix/externalscripts/zbxwmi-auth
-  sudo chmod 755 /usr/lib/zabbix/externalscripts/zbxwmi-auth
+  sudo cp ntwwmi-auth /usr/lib/zabbix/externalscripts/
+  sudo chown zabbix:zabbix /usr/lib/zabbix/externalscripts/ntwwmi-auth
+  sudo chmod 755 /usr/lib/zabbix/externalscripts/ntwwmi-auth
 
 Item keys:
-  zbxwmi-auth["{$WMI.USER}","{$WMI.PASSWORD}","{$WMI.DOMAIN}", <any zbxwmi arguments>]
-      Runs zbxwmi with those credentials.
+  ntwwmi-auth["{$WMI.USER}","{$WMI.PASSWORD}","{$WMI.DOMAIN}", <any ntwwmi arguments>]
+      Runs ntwwmi with those credentials.
 
-  zbxwmi-auth["{$WMI.USER}","{$WMI.PASSWORD}","{$WMI.DOMAIN}","-members",{HOST.CONN}]
+  ntwwmi-auth["{$WMI.USER}","{$WMI.PASSWORD}","{$WMI.DOMAIN}","-members",{HOST.CONN}]
       Run against a domain controller. Returns the AD computer objects, each with
       an extra "IPAddress" field looked up in the DC's own DNS (root\\MicrosoftDNS),
-      so discovered hosts can be created by IP without the Zabbix server resolving
+      so discovered hosts can be created by IP without the server resolving
       the domain's names.
 
 The credentials are written to a private temporary file (mode 0600) for the
@@ -96,8 +102,8 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.realpath(__file__))
-ZBXWMI = os.path.join(HERE, 'zbxwmi')
-TIMEOUT = 25  # seconds per zbxwmi call
+NTWWMI = os.path.join(HERE, 'ntwwmi')
+TIMEOUT = 25  # seconds per ntwwmi call
 
 
 def fail(msg):
@@ -110,11 +116,11 @@ def last_json(text):
         line = line.strip()
         if line.startswith('[') or line.startswith('{'):
             return json.loads(line)
-    raise RuntimeError(text.strip() or 'no output from zbxwmi')
+    raise RuntimeError(text.strip() or 'no output from ntwwmi')
 
 
 def query(cred, target, *args):
-    p = subprocess.run([ZBXWMI, '-cred', cred, '-action', 'json', *args, target],
+    p = subprocess.run([NTWWMI, '-cred', cred, '-action', 'json', *args, target],
                        capture_output=True, text=True, timeout=TIMEOUT)
     lines = [l.strip() for l in p.stdout.splitlines() if l.strip()]
     errors = [l for l in lines if 'error' in l.lower() and not l.startswith(('[', '{'))]
@@ -166,15 +172,32 @@ def members(cred, target):
     return 0
 
 
+def events_discovery(target, logfile, idlist):
+    """Turn a comma-separated event-ID list into LLD JSON (one row per ID).
+    Does NOT query Windows - it only emits the list the admin configured, so it is
+    cheap and predictable. Each row: {#EVENTLOG}, {#EVENTID}."""
+    import json as _json
+    rows = []
+    for raw in str(idlist).split(','):
+        eid = raw.strip()
+        if not eid or eid.startswith('{$'):   # empty or unset macro
+            continue
+        if not eid.isdigit():
+            continue
+        rows.append({'{#EVENTLOG}': logfile, '{#EVENTID}': eid})
+    print(_json.dumps(rows))
+    return 0
+
+
 def main():
     if len(sys.argv) < 5:
-        fail('usage: zbxwmi-auth USER PASSWORD DOMAIN <zbxwmi args> | -members TARGET')
+        fail('usage: ntwwmi-auth USER PASSWORD DOMAIN <ntwwmi args> | -members TARGET | -events LOG IDLIST')
     user, password, domain = sys.argv[1:4]
     args = sys.argv[4:]
     if not user or not password or user.startswith('{$') or password.startswith('{$'):
         fail('WMI credentials are not set: fill in {$WMI.USER}, {$WMI.PASSWORD} and {$WMI.DOMAIN} on the host')
 
-    fd, cred = tempfile.mkstemp(prefix='zbxwmi-', dir='/dev/shm' if os.path.isdir('/dev/shm') else None)
+    fd, cred = tempfile.mkstemp(prefix='ntwwmi-', dir='/dev/shm' if os.path.isdir('/dev/shm') else None)
     try:
         with os.fdopen(fd, 'w') as f:
             f.write('%s\n%s\n%s\n' % (user, password, domain))
@@ -182,11 +205,21 @@ def main():
             if len(args) < 2:
                 fail('usage: -members TARGET')
             return members(cred, args[1])
-        p = subprocess.run([ZBXWMI, '-cred', cred] + args, capture_output=True, text=True, timeout=TIMEOUT)
+        if args[0] == '-events':
+            # -events LOGFILE IDLIST  (no WMI call; emits discovery JSON from the list)
+            if len(args) < 3:
+                fail('usage: -events LOGFILE "id,id,id"')
+            return events_discovery(None, args[1], args[2])
+        # -tag VALUE is a key-disambiguator only (makes per-log prototype keys unique);
+        # strip it so the WMI engine never sees it.
+        if '-tag' in args:
+            ti = args.index('-tag')
+            del args[ti:ti+2]
+        p = subprocess.run([NTWWMI, '-cred', cred] + args, capture_output=True, text=True, timeout=TIMEOUT)
         sys.stdout.write(p.stdout)
         return p.returncode
     except subprocess.TimeoutExpired:
-        fail('zbxwmi timed out after %ss' % TIMEOUT)
+        fail('ntwwmi timed out after %ss' % TIMEOUT)
     finally:
         try:
             os.unlink(cred)
@@ -196,17 +229,17 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
-ZBXWMI_AUTH_EOF
-chown zabbix:zabbix "$DIR/zbxwmi-auth"
-chmod 755 "$DIR/zbxwmi-auth"
-ok "$DIR/zbxwmi-auth"
+NTWWMI_AUTH_EOF
+chown zabbix:zabbix "$DIR/ntwwmi-auth"
+chmod 755 "$DIR/ntwwmi-auth"
+ok "$DIR/ntwwmi-auth"
 
 step "Checking the scripts run as the zabbix user"
-out="$(sudo -u zabbix "$DIR/zbxwmi" -h 2>&1 || true)"
-echo "$out" | grep -qi 'usage' || die "zbxwmi did not start as the zabbix user:
+out="$(sudo -u zabbix "$DIR/ntwwmi" -h 2>&1 || true)"
+echo "$out" | grep -qi 'usage' || die "ntwwmi did not start as the zabbix user:
 $out"
-out="$(sudo -u zabbix "$DIR/zbxwmi-auth" 2>&1 || true)"
-echo "$out" | grep -qi 'usage' || die "zbxwmi-auth did not start as the zabbix user:
+out="$(sudo -u zabbix "$DIR/ntwwmi-auth" 2>&1 || true)"
+echo "$out" | grep -qi 'usage' || die "ntwwmi-auth did not start as the zabbix user:
 $out"
 ok "both scripts start correctly"
 
@@ -249,5 +282,5 @@ fi
 
 printf '\n\033[1;32mDone.\033[0m This server is ready for Netwatch agentless Windows/AD monitoring.\n\n'
 printf 'Test against a client DC:\n'
-printf "  sudo -u zabbix %s/zbxwmi-auth <admin-user> '<password>' <DOMAIN> -action get -fields Caption Win32_OperatingSystem <DC-IP>\n\n" "$DIR"
+printf "  sudo -u zabbix %s/ntwwmi-auth <admin-user> '<password>' <DOMAIN> -action get -fields Caption Win32_OperatingSystem <DC-IP>\n\n" "$DIR"
 printf 'Then onboard the client in the Zabbix web interface (guide, Part 3).\n'
