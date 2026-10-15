@@ -172,26 +172,115 @@ def members(cred, target):
     return 0
 
 
+# Friendly names for the common Windows event IDs, keyed by log then ID.
+# Unknown IDs simply show the number; a name given inline in the macro
+# ("1102:My label") overrides the table.
+EVENT_NAMES = {
+    'Security': {
+        '1102': 'Audit log cleared', '4624': 'Logon', '4625': 'Failed logon',
+        '4634': 'Logoff', '4648': 'Explicit-credential logon',
+        '4672': 'Special privileges assigned', '4688': 'Process created',
+        '4719': 'Audit policy changed', '4720': 'Account created',
+        '4722': 'Account enabled', '4723': 'Password change attempt',
+        '4724': 'Password reset', '4725': 'Account disabled',
+        '4726': 'Account deleted', '4728': 'Added to global group',
+        '4732': 'Added to local group', '4739': 'Domain policy changed',
+        '4740': 'Account lockout', '4756': 'Added to universal group',
+        '4767': 'Account unlocked',
+    },
+    'System': {
+        '41': 'Dirty reboot (kernel-power)', '51': 'Disk error',
+        '1001': 'Bugcheck (BSOD)', '1074': 'Shutdown initiated',
+        '6005': 'Event log started', '6006': 'Event log stopped',
+        '6008': 'Unexpected shutdown', '7000': 'Service failed to start',
+        '7031': 'Service crashed', '7034': 'Service terminated unexpectedly',
+        '7045': 'New service installed',
+    },
+    'Directory Service': {
+        '1000': 'DC startup', '1311': 'KCC topology error',
+        '1388': 'Lingering object added', '1864': 'Replication status',
+        '1988': 'Lingering object detected', '2042': 'Replication past tombstone',
+    },
+    'DFS Replication': {
+        '2213': 'DFSR needs manual recovery', '4012': 'Replication disabled (stale)',
+        '5008': 'Replication stopped', '5014': 'DFSR communication error',
+    },
+}
+
+
 def events_discovery(target, logfile, idlist):
     """Turn a comma-separated event-ID list into LLD JSON (one row per ID).
     Does NOT query Windows - it only emits the list the admin configured, so it is
-    cheap and predictable. Each row: {#EVENTLOG}, {#EVENTID}."""
+    cheap and predictable. Each row: {#EVENTLOG}, {#EVENTID}, {#EVENTNAME}.
+    An ID may carry an inline label ("1102:Audit log cleared"); otherwise the
+    built-in table supplies a name, and an unknown ID shows just the number."""
     import json as _json
+    table = EVENT_NAMES.get(logfile, {})
     rows = []
     for raw in str(idlist).split(','):
-        eid = raw.strip()
-        if not eid or eid.startswith('{$'):   # empty or unset macro
+        part = raw.strip()
+        if not part or part.startswith('{$'):   # empty or unset macro
             continue
+        if ':' in part:                         # inline "id:label" override
+            eid, _, name = part.partition(':')
+            eid, name = eid.strip(), name.strip()
+        else:
+            eid, name = part, ''
         if not eid.isdigit():
             continue
-        rows.append({'{#EVENTLOG}': logfile, '{#EVENTID}': eid})
+        if not name:
+            name = table.get(eid, '')
+        # leading ": " so the item name reads "Event Security 1102: Audit log cleared";
+        # blank when unknown, leaving just "Event Security 1102".
+        label = ': ' + name if name else ''
+        rows.append({'{#EVENTLOG}': logfile, '{#EVENTID}': eid, '{#EVENTNAME}': label})
+    print(_json.dumps(rows))
+    return 0
+
+
+def logs_discovery(enabled, spec):
+    """Standalone log template. ENABLED is an on/off flag; SPEC lists any number of
+    logs and their IDs as  LogName=id,id;LogName=id:Label,id  (';' between logs,
+    ',' between IDs, optional 'id:Label'). Emits LLD rows {#EVENTLOG},{#EVENTID},
+    {#EVENTNAME}. No WMI call - it only turns the admin's config into discovery.
+    NOTE: only classic logs (System/Application/Security/Setup/Directory Service/
+    DFS Replication/DNS Server/Windows PowerShell/...) are reachable over WMI;
+    nested 'Applications and Services Logs' channels cannot be read agentless."""
+    import json as _json
+    rows = []
+    if str(enabled).strip().lower() not in ('1', 'true', 'yes', 'on'):
+        print(_json.dumps(rows)); return 0           # turned off
+    if not spec or spec.strip().startswith('{$'):
+        print(_json.dumps(rows)); return 0           # unset / empty
+    for block in str(spec).split(';'):
+        block = block.strip()
+        if not block or '=' not in block:
+            continue
+        logname, _, idlist = block.partition('=')
+        logname = logname.strip()
+        table = EVENT_NAMES.get(logname, {})
+        for raw in idlist.split(','):
+            part = raw.strip()
+            if not part:
+                continue
+            if ':' in part:
+                eid, _, name = part.partition(':')
+                eid, name = eid.strip(), name.strip()
+            else:
+                eid, name = part, ''
+            if not eid.isdigit():
+                continue
+            if not name:
+                name = table.get(eid, '')
+            label = ': ' + name if name else ''
+            rows.append({'{#EVENTLOG}': logname, '{#EVENTID}': eid, '{#EVENTNAME}': label})
     print(_json.dumps(rows))
     return 0
 
 
 def main():
     if len(sys.argv) < 5:
-        fail('usage: ntwwmi-auth USER PASSWORD DOMAIN <ntwwmi args> | -members TARGET | -events LOG IDLIST')
+        fail('usage: ntwwmi-auth USER PASSWORD DOMAIN <ntwwmi args> | -members TARGET | -events LOG IDLIST | -logs ENABLED SPEC')
     user, password, domain = sys.argv[1:4]
     args = sys.argv[4:]
     if not user or not password or user.startswith('{$') or password.startswith('{$'):
@@ -210,6 +299,11 @@ def main():
             if len(args) < 3:
                 fail('usage: -events LOGFILE "id,id,id"')
             return events_discovery(None, args[1], args[2])
+        if args[0] == '-logs':
+            # -logs ENABLED SPEC  (no WMI call; multi-log discovery for the log template)
+            if len(args) < 3:
+                fail('usage: -logs ENABLED "Log=id,id;Log=id:Label"')
+            return logs_discovery(args[1], args[2])
         # -tag VALUE is a key-disambiguator only (makes per-log prototype keys unique);
         # strip it so the WMI engine never sees it.
         if '-tag' in args:
@@ -244,20 +338,26 @@ $out"
 ok "both scripts start correctly"
 
 if [ -n "$ZBX_URL" ] && [ -n "$ZBX_TOKEN" ]; then
-  step "Importing the template through the Zabbix API"
+  step "Importing templates through the Zabbix API"
   TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-  if [ -n "$TEMPLATE_FILE" ]; then
-    cp "$TEMPLATE_FILE" "$TMP/template.json"
-  elif [ -n "$REPO_RAW" ]; then
-    curl -fsSL "${REPO_RAW%/}/template_windows_ad_ds_wmi.json" -o "$TMP/template.json" \
-      || die "could not download the template from $REPO_RAW"
-  else
-    die "set REPO_RAW or TEMPLATE_FILE so the installer can find the template"
-  fi
-  python3 - "$TMP/template.json" > "$TMP/request.json" <<'PY_EOF'
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  import_one() {
+    local name="$1" src=""
+    if [ -n "$TEMPLATE_DIR" ] && [ -f "$TEMPLATE_DIR/$name" ]; then
+      src="$TEMPLATE_DIR/$name"
+    elif [ -f "$SCRIPT_DIR/$name" ]; then
+      src="$SCRIPT_DIR/$name"
+    elif [ -n "$REPO_RAW" ]; then
+      curl -fsSL "${REPO_RAW%/}/$name" -o "$TMP/$name" || die "could not download $name from $REPO_RAW"
+      src="$TMP/$name"
+    else
+      die "cannot find $name (set TEMPLATE_DIR or REPO_RAW, or run from the repo clone)"
+    fi
+    python3 - "$src" > "$TMP/request.json" <<'PY_EOF'
 import json, sys
-src = open(sys.argv[1]).read()
-json.loads(src)  # fail early on a broken download
+source = open(sys.argv[1]).read()
+json.loads(source)  # fail early on a broken file
 full = {"createMissing": True, "updateExisting": True, "deleteMissing": True}
 rules = {
     "template_groups": {"createMissing": True, "updateExisting": True},
@@ -267,17 +367,24 @@ rules = {
     "graphs": full, "templateDashboards": full, "valueMaps": full,
 }
 print(json.dumps({"jsonrpc": "2.0", "method": "configuration.import", "id": 1,
-                  "params": {"format": "json", "source": src, "rules": rules}}))
+                  "params": {"format": "json", "source": source, "rules": rules}}))
 PY_EOF
-  resp="$(curl -sS -X POST "${ZBX_URL%/}/api_jsonrpc.php" \
-            -H 'Content-Type: application/json-rpc' \
-            -H "Authorization: Bearer $ZBX_TOKEN" \
-            --data @"$TMP/request.json")" || die "could not reach ${ZBX_URL%/}/api_jsonrpc.php"
-  echo "$resp" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("result") is True else 1)' \
-    || die "template import failed: $resp"
-  ok "Template Windows AD DS WMI imported"
+    resp="$(curl -sS -X POST "${ZBX_URL%/}/api_jsonrpc.php" \
+              -H 'Content-Type: application/json-rpc' \
+              -H "Authorization: Bearer $ZBX_TOKEN" \
+              --data @"$TMP/request.json")" || die "could not reach ${ZBX_URL%/}/api_jsonrpc.php"
+    echo "$resp" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("result") is True else 1)' \
+      || die "import of $name failed: $resp"
+    ok "imported $name"
+  }
+
+  # Order matters: the member template must exist before the DC template links it.
+  import_one template_member_netwatch_wmi.json
+  import_one template_dc_netwatch_wmi.json
+  import_one template_eventlogs_netwatch_wmi.json
+  ok "all templates imported (member, DC, event logs)"
 else
-  step "Skipping template import (ZBX_URL / ZBX_TOKEN not set): import it in the web interface"
+  step "Skipping template import (ZBX_URL / ZBX_TOKEN not set): import them in the web interface"
 fi
 
 printf '\n\033[1;32mDone.\033[0m This server is ready for Netwatch agentless Windows/AD monitoring.\n\n'
