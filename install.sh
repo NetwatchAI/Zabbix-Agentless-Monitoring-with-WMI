@@ -1,26 +1,9 @@
 #!/usr/bin/env bash
-# ---------------------------------------------------------------------------
-# install.sh - one-shot setup of agentless Windows/AD monitoring on an Ubuntu
-# Netwatch agentless WMI setup: installs ntwwmi, ntwwmi-auth, fping, and (optionally) the template.
-#
-# Repo: set your own; pass REPO_RAW or edit the default below
-#
-# Install:
-#   curl -fsSL https://<your-repo>/install.sh | sudo bash
-#
-# Install and import/update the template through the Zabbix API (Zabbix is the engine underneath):
-#   curl -fsSL https://<your-repo>/install.sh | \
-#     sudo ZBX_URL=http://<zabbix-server>/zabbix ZBX_TOKEN=<api-token> bash
-#
-# Safe to run again: it updates what is there and skips what is done.
-# ---------------------------------------------------------------------------
 set -euo pipefail
 
-ZBX_URL="${ZBX_URL:-}"             # URL you open Zabbix with, e.g. http://10.0.0.5/zabbix
-ZBX_TOKEN="${ZBX_TOKEN:-}"         # Zabbix API token (Users > API tokens)
-REPO_RAW="${REPO_RAW:-https://<your-repo>}"
-TEMPLATE_FILE="${TEMPLATE_FILE:-}" # or a local path to the template JSON
 CONF="${ZABBIX_CONF:-/etc/zabbix/zabbix_server.conf}"
+ZBX_URL="${ZBX_URL:-}"
+ZBX_TOKEN="${ZBX_TOKEN:-}"
 
 step() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 ok()   { printf '    \033[32mOK\033[0m %s\n' "$*"; }
@@ -52,7 +35,7 @@ apt-get install -y -qq python3 python3-impacket git fping curl ca-certificates s
 python3 -c 'import impacket' || die "python3-impacket did not install correctly"
 ok "packages installed"
 
-# Zabbix looks for fping in /usr/sbin by default; Ubuntu installs it in /usr/bin
+# Netwatch looks for fping in /usr/sbin by default; Ubuntu installs it in /usr/bin
 if [ ! -e /usr/sbin/fping ] && [ -x /usr/bin/fping ]; then
   ln -s /usr/bin/fping /usr/sbin/fping
   ok "linked /usr/sbin/fping -> /usr/bin/fping"
@@ -340,6 +323,8 @@ def main():
             del args[ti:ti+2]
         p = subprocess.run([NTWWMI, '-cred', cred] + args, capture_output=True, text=True, timeout=TIMEOUT)
         sys.stdout.write(p.stdout)
+        if p.stderr:
+            sys.stderr.write(p.stderr)
         return p.returncode
     except subprocess.TimeoutExpired:
         fail('ntwwmi timed out after %ss' % TIMEOUT)
@@ -367,56 +352,64 @@ $out"
 ok "both scripts start correctly"
 
 if [ -n "$ZBX_URL" ] && [ -n "$ZBX_TOKEN" ]; then
-  step "Importing templates through the Zabbix API"
-  TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  step "Importing Netwatch templates via API"
 
   import_one() {
-    local name="$1" src=""
-    if [ -n "$TEMPLATE_DIR" ] && [ -f "$TEMPLATE_DIR/$name" ]; then
-      src="$TEMPLATE_DIR/$name"
-    elif [ -f "$SCRIPT_DIR/$name" ]; then
-      src="$SCRIPT_DIR/$name"
-    elif [ -n "$REPO_RAW" ]; then
-      curl -fsSL "${REPO_RAW%/}/$name" -o "$TMP/$name" || die "could not download $name from $REPO_RAW"
-      src="$TMP/$name"
-    else
-      die "cannot find $name (set TEMPLATE_DIR or REPO_RAW, or run from the repo clone)"
-    fi
-    python3 - "$src" > "$TMP/request.json" <<'PY_EOF'
-import json, sys
-source = open(sys.argv[1]).read()
-json.loads(source)  # fail early on a broken file
-full = {"createMissing": True, "updateExisting": True, "deleteMissing": True}
-rules = {
-    "template_groups": {"createMissing": True, "updateExisting": True},
-    "templates": {"createMissing": True, "updateExisting": True},
-    "templateLinkage": {"createMissing": True},
-    "items": full, "discoveryRules": full, "triggers": full,
-    "graphs": full, "templateDashboards": full, "valueMaps": full,
+    local file="$1"
+    [ -f "$file" ] || { printf '    \033[33mSKIP\033[0m %s not found\n' "$file"; return; }
+    python3 - "$ZBX_URL" "$ZBX_TOKEN" "$file" <<'PYEOF'
+import sys, json, urllib.request, urllib.parse
+
+url, token, path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    source = f.read()
+
+payload = {
+    "jsonrpc": "2.0", "id": 1, "method": "configuration.import",
+    "params": {
+        "format": "json",
+        "source": source,
+        "rules": {
+            "templates":        {"createMissing": True,  "updateExisting": True},
+            "items":            {"createMissing": True,  "updateExisting": True, "deleteMissing": False},
+            "triggers":         {"createMissing": True,  "updateExisting": True, "deleteMissing": False},
+            "graphs":           {"createMissing": True,  "updateExisting": True, "deleteMissing": False},
+            "discoveryRules":   {"createMissing": True,  "updateExisting": True, "deleteMissing": False},
+            "itemPrototypes":   {"createMissing": True,  "updateExisting": True, "deleteMissing": False},
+            "triggerPrototypes":{"createMissing": True,  "updateExisting": True, "deleteMissing": False},
+            "graphPrototypes":  {"createMissing": True,  "updateExisting": True, "deleteMissing": False},
+            "httptests":        {"createMissing": True,  "updateExisting": True, "deleteMissing": False},
+            "valueMaps":        {"createMissing": True,  "updateExisting": True}
+        }
+    }
 }
-print(json.dumps({"jsonrpc": "2.0", "method": "configuration.import", "id": 1,
-                  "params": {"format": "json", "source": source, "rules": rules}}))
-PY_EOF
-    resp="$(curl -sS -X POST "${ZBX_URL%/}/api_jsonrpc.php" \
-              -H 'Content-Type: application/json-rpc' \
-              -H "Authorization: Bearer $ZBX_TOKEN" \
-              --data @"$TMP/request.json")" || die "could not reach ${ZBX_URL%/}/api_jsonrpc.php"
-    echo "$resp" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("result") is True else 1)' \
-      || die "import of $name failed: $resp"
-    ok "imported $name"
+data = json.dumps(payload).encode()
+req = urllib.request.Request(url.rstrip('/') + '/api_jsonrpc.php',
+    data=data,
+    headers={"Content-Type": "application/json", "Authorization": "Bearer " + token})
+with urllib.request.urlopen(req, timeout=30) as r:
+    resp = json.load(r)
+if "error" in resp:
+    print("ERROR:", resp["error"].get("data", resp["error"]))
+    sys.exit(1)
+print("imported:", path)
+PYEOF
   }
 
-  # Order matters: the member template must exist before the DC template links it.
-  import_one template_member_netwatch_wmi.json
-  import_one template_dc_netwatch_wmi.json
-  import_one template_eventlogs_netwatch_wmi.json
-  ok "all templates imported (member, DC, event logs)"
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  for tmpl in \
+    "$SCRIPT_DIR/template_dc_netwatch_wmi.json" \
+    "$SCRIPT_DIR/template_member_netwatch_wmi.json" \
+    "$SCRIPT_DIR/template_eventlogs_netwatch_wmi.json"
+  do
+    import_one "$tmpl"
+  done
+  ok "template import done"
 else
-  step "Skipping template import (ZBX_URL / ZBX_TOKEN not set): import them in the web interface"
+  printf '    \033[33mSKIP\033[0m set ZBX_URL and ZBX_TOKEN to import templates automatically\n'
 fi
 
 printf '\n\033[1;32mDone.\033[0m This server is ready for Netwatch agentless Windows/AD monitoring.\n\n'
 printf 'Test against a client DC:\n'
 printf "  sudo -u zabbix %s/ntwwmi-auth <admin-user> '<password>' <DOMAIN> -action get -fields Caption Win32_OperatingSystem <DC-IP>\n\n" "$DIR"
-printf 'Then onboard the client in the Zabbix web interface (guide, Part 3).\n'
+printf 'Then import the templates in the Netwatch web interface and onboard the client (guide, Part 3).\n'
