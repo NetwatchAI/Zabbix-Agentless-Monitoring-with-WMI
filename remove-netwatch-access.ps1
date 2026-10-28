@@ -5,6 +5,7 @@
   .\remove-netwatch-access.ps1 -MonitoringAccount <account>
   .\remove-netwatch-access.ps1 -MonitoringAccount <account> -DeleteAccount
   .\remove-netwatch-access.ps1 -FirewallOnly
+  .\remove-netwatch-access.ps1 -MonitoringAccount S-1-5-21-...   # account already deleted: clean up by SID
 
   Audit policy is left as it is: other tools may rely on it.
 #>
@@ -50,10 +51,16 @@ Good "Domain Admin in $($domain.DNSRoot)"
 
 if (-not $FirewallOnly) {
     if (-not $MonitoringAccount) { Die 'give the monitoring account with -MonitoringAccount <name>, or use -FirewallOnly.' }
-    try   { $acct = Get-ADUser -Identity $MonitoringAccount }
-    catch { Die "monitoring account '$MonitoringAccount' was not found in $($domain.DNSRoot)." }
-    $acctSid = $acct.SID.Value
-    Good "monitoring account $($acct.SamAccountName) ($acctSid)"
+    $acct = try { Get-ADUser -Identity $MonitoringAccount } catch { $null }
+    if ($acct) {
+        $acctSid = $acct.SID.Value
+        Good "monitoring account $($acct.SamAccountName) ($acctSid)"
+    } elseif ($MonitoringAccount -match '^S-1-5-21-[\d-]+$') {
+        $acctSid = $MonitoringAccount
+        Warn "account $acctSid no longer exists - cleaning up what is left by SID"
+    } else {
+        Die "monitoring account '$MonitoringAccount' was not found in $($domain.DNSRoot). If it was already deleted, pass its SID instead (S-1-5-21-...)."
+    }
 }
 
 $dcs = @(Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName)
@@ -90,7 +97,7 @@ $dcOk = $true
 foreach ($g in $groupSids) {
     try {
         if (Get-ADGroupMember -Identity $g | Where-Object { $_.SID.Value -eq $acctSid }) {
-            Remove-ADGroupMember -Identity $g -Members $acct -Confirm:$false
+            Remove-ADGroupMember -Identity $g -Members $(if ($acct) { $acct } else { $acctSid }) -Confirm:$false
             Good "$((Get-ADGroup $g).Name) - removed"
         }
     } catch { $dcOk = $false; Warn "$g - $($_.Exception.Message)" }
@@ -121,7 +128,7 @@ foreach ($t in $targets) {
             $sd = $out.Descriptor
             $keep = @($sd.DACL | Where-Object { $_.Trustee.SIDString -ne $sid })
             if ($keep.Count -eq @($sd.DACL).Count) { return 'none' }
-            $sd.DACL = $keep
+            $sd.DACL = [System.Management.ManagementBaseObject[]]@($keep | ForEach-Object { $_.psobject.ImmediateBaseObject })
             $res = Invoke-WmiMethod @sys -Name SetSecurityDescriptor -ArgumentList $sd.psobject.ImmediateBaseObject
             if ($res.ReturnValue -ne 0) { throw "SetSecurityDescriptor returned $($res.ReturnValue)" }
             'removed'
@@ -153,10 +160,15 @@ foreach ($t in $targets) {
     } catch { Warn "$t - $($_.Exception.Message)"; Mark $t 'Services' 'FAILED' }
 }
 
-if ($DeleteAccount) {
+if ($DeleteAccount -and $acct) {
     Step 'Deleting the monitoring account'
-    Remove-ADUser -Identity $acct -Confirm:$false
-    Good "deleted $($acct.SamAccountName)"
+    $stepFailed = @($Report.Values | ForEach-Object { $_.Values } | Where-Object { $_ -like 'FAILED*' })
+    if ($stepFailed.Count) {
+        Warn "not deleted: $($stepFailed.Count) step(s) failed. Fix them and re-run, so nothing is left pointing at a deleted account."
+    } else {
+        Remove-ADUser -Identity $acct -Confirm:$false
+        Good "deleted $($acct.SamAccountName)"
+    }
 }
 
 }
