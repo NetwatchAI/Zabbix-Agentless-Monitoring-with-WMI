@@ -1,24 +1,22 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# install.sh - one-shot setup of agentless Windows/AD monitoring on an Ubuntu
-# Netwatch agentless WMI setup: installs ntwwmi, ntwwmi-auth, fping, and (optionally) the template.
-#
-# Repo: set your own; pass REPO_RAW or edit the default below
+# install.sh - sets up a Netwatch Watchnode for agentless Windows/AD (WMI) monitoring:
+# installs ntwwmi, ntwwmi-auth and fping, and optionally imports the templates.
 #
 # Install:
-#   curl -fsSL https://<your-repo>/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/NetwatchAI/Zabbix-Agentless-Monitoring-with-WMI/main/install.sh | sudo bash
 #
-# Install and import/update the template through the Zabbix API (Zabbix is the engine underneath):
-#   curl -fsSL https://<your-repo>/install.sh | \
-#     sudo ZBX_URL=http://<zabbix-server>/zabbix ZBX_TOKEN=<api-token> bash
+# Install and import the templates through the Netwatch Server API:
+#   curl -fsSL https://raw.githubusercontent.com/NetwatchAI/Zabbix-Agentless-Monitoring-with-WMI/main/install.sh | \
+#     sudo ZBX_URL=https://<netwatch-server>/zabbix ZBX_TOKEN=<api-token> bash
 #
 # Safe to run again: it updates what is there and skips what is done.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-ZBX_URL="${ZBX_URL:-}"             # URL you open Zabbix with, e.g. http://10.0.0.5/zabbix
+ZBX_URL="${ZBX_URL:-}"             # URL you open Zabbix with, e.g. https://<netwatch-server>/zabbix
 ZBX_TOKEN="${ZBX_TOKEN:-}"         # Zabbix API token (Users > API tokens)
-REPO_RAW="${REPO_RAW:-https://<your-repo>}"
+REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/NetwatchAI/Zabbix-Agentless-Monitoring-with-WMI/main}"
 TEMPLATE_DIR="${TEMPLATE_DIR:-}"   # folder holding the template JSON files (defaults to this script's folder)
 CONF="${ZABBIX_CONF:-}"            # auto: Watchnode (proxy) config first, then server config
 ZBXWMI_REF="${ZBXWMI_REF:-77016eec84010c5eb4e66214599e56755794cc35}"  # pinned, reviewed version of the WMI connector
@@ -107,6 +105,7 @@ duration of the call and deleted afterwards.
 """
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -154,7 +153,7 @@ def members(cred, target):
         return ''
 
     # The DNS WMI provider only answers record queries scoped to one zone,
-    # so ask each zone the computers live in (e.g. "mamba.dc").
+    # so ask each zone the computers live in (e.g. "contoso.local").
     zones = sorted({dns_name(c).split('.', 1)[1] for c in computers if '.' in dns_name(c)})
     ips = {}
     for zone in zones:
@@ -168,7 +167,9 @@ def members(cred, target):
             except Exception as e:
                 last_error = e
         if records is None:
-            sys.stderr.write('DNS lookup on the DC failed for zone %s: %s\n' % (zone, last_error))
+            # Usually access denied: the DNS WMI provider only answers DnsAdmins.
+            # Fall back to the Watchnode's own DNS below; never print here, the
+            # output must stay pure JSON.
             continue
         for r in records:
             name = str(r.get('OwnerName') or '').lower().rstrip('.')
@@ -176,8 +177,16 @@ def members(cred, target):
             if name and ip and not ip.startswith('169.254.') and name not in ips:
                 ips[name] = ip
 
+    socket.setdefaulttimeout(3)
     for c in computers:
-        c['IPAddress'] = ips.get(dns_name(c), '')
+        name = dns_name(c)
+        ip = ips.get(name, '')
+        if not ip and name:
+            try:
+                ip = socket.gethostbyname(name)
+            except OSError:
+                ip = ''
+        c['IPAddress'] = ip
     print(json.dumps(computers))
     return 0
 
@@ -365,7 +374,7 @@ fi
 if [ -n "$ZBX_URL" ] && [ -n "$ZBX_TOKEN" ]; then
   step "Importing templates through the Zabbix API"
   TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 
   import_one() {
     local name="$1" src=""
