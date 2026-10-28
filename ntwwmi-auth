@@ -24,6 +24,7 @@ duration of the call and deleted afterwards.
 """
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -71,7 +72,7 @@ def members(cred, target):
         return ''
 
     # The DNS WMI provider only answers record queries scoped to one zone,
-    # so ask each zone the computers live in (e.g. "mamba.dc").
+    # so ask each zone the computers live in (e.g. "contoso.local").
     zones = sorted({dns_name(c).split('.', 1)[1] for c in computers if '.' in dns_name(c)})
     ips = {}
     for zone in zones:
@@ -85,7 +86,9 @@ def members(cred, target):
             except Exception as e:
                 last_error = e
         if records is None:
-            sys.stderr.write('DNS lookup on the DC failed for zone %s: %s\n' % (zone, last_error))
+            # Usually access denied: the DNS WMI provider only answers DnsAdmins.
+            # Fall back to the Watchnode's own DNS below; never print here, the
+            # output must stay pure JSON.
             continue
         for r in records:
             name = str(r.get('OwnerName') or '').lower().rstrip('.')
@@ -93,8 +96,16 @@ def members(cred, target):
             if name and ip and not ip.startswith('169.254.') and name not in ips:
                 ips[name] = ip
 
+    socket.setdefaulttimeout(3)
     for c in computers:
-        c['IPAddress'] = ips.get(dns_name(c), '')
+        name = dns_name(c)
+        ip = ips.get(name, '')
+        if not ip and name:
+            try:
+                ip = socket.gethostbyname(name)
+            except OSError:
+                ip = ''
+        c['IPAddress'] = ip
     print(json.dumps(computers))
     return 0
 
