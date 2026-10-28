@@ -43,6 +43,7 @@ No WMI traffic leaves the client's network. The only outbound connection is the 
 - Windows Server 2012 or newer
 - A Domain Admin to run the setup script once
 - A normal domain user as the monitoring account (no admin rights needed)
+- PowerShell remoting (WinRM, TCP 5985) from the DC to every server - on by default since Windows Server 2012. The setup and removal scripts use it to make each change on the server itself.
 
 ## Setup
 
@@ -129,12 +130,26 @@ sc.exe sdset scmanager (Get-Content C:\ProgramData\Netwatch\scmanager-backup.txt
 
 ### 4. Test from the Watchnode
 
+Use IP addresses, the same way Netwatch polls the hosts:
+
 ```bash
-W=/usr/lib/zabbix/externalscripts/ntwwmi-auth
-sudo -u zabbix $W "<user>" "<password>" "<DOMAIN>" -action json -fields Caption Win32_OperatingSystem <server-ip>
+W=/usr/lib/zabbix/externalscripts/ntwwmi-auth; U=<user>; D=<DOMAIN>
+read -s -p "Password: " P; echo
+
+# Windows version (account, groups, WMI permission, firewall)
+sudo -u zabbix $W $U "$P" $D -action json -fields Caption Win32_OperatingSystem <server-ip>
+
+# Services (read-only service permission)
+sudo -u zabbix $W $U "$P" $D -action json -fields Name,State Win32_Service <server-ip> | head -c 200; echo
+
+# AD replication on a DC (WMI permission inherited by the AD namespace; [] on a single-DC domain)
+sudo -u zabbix $W $U "$P" $D -namespace '//./root/MicrosoftActiveDirectory' -action json -key SourceDsaCN -fields SourceDsaCN,LastSyncResult MSAD_ReplNeighbor <dc-ip>
+
+# Member discovery (every server should come back with an IPAddress)
+sudo -u zabbix $W $U "$P" $D -members <dc-ip>
 ```
 
-JSON back means the account, firewall and WMI permissions work. `access denied` means a permission from step 2 is missing on that server.
+`read -s` keeps the password off the screen and out of the shell history. JSON back means that permission works; `access denied` points at the setup step to check, and a call that hangs means the firewall rules have not reached that server yet.
 
 ## Uninstall
 
@@ -193,5 +208,6 @@ Security events only appear when auditing is on; step 5 of the setup script hand
 | Timeout / no data | Firewall or network path blocked | Test TCP 135 from the Watchnode to the server |
 | `rpc_s_access_denied` on a member server | Account permissions not set on that server | Rerun the setup script (member servers are included by default); check its row in the summary |
 | Member servers discovered without hosts | The Watchnode cannot reach the DC's DNS (UDP 53) | Allow DNS from the Watchnode to the DCs; `dig +short <server>.<domain> @<DC-IP>` on the Watchnode should return an IP |
+| Setup summary shows FAILED or PENDING for a server | The DC cannot reach it over WinRM | Run `Test-WSMan <server>` on the DC; enable WinRM (`Enable-PSRemoting`) on that server and rerun the script |
+| A WMI test hangs, then times out | Firewall rules not on that server yet | Rerun the setup script, or run `gpupdate /target:computer /force` on that server |
 | `WBEM_E_INVALID_QUERY` in an item test | `{#EVENTLOG}` / `{#EVENTID}` empty in the test dialog | Fill them in under Macros before testing |
-
