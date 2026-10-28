@@ -123,14 +123,16 @@ foreach ($t in $targets) {
         $r = Invoke-Command -ComputerName $t -ErrorAction Stop -ArgumentList $acctSid -ScriptBlock {
             param($sid)
             $sys = @{ Namespace = 'root'; Path = '__SystemSecurity=@'; ErrorAction = 'Stop' }
-            $out = Invoke-WmiMethod @sys -Name GetSecurityDescriptor
-            if ($out.ReturnValue -ne 0) { throw "GetSecurityDescriptor returned $($out.ReturnValue)" }
-            $sd = $out.Descriptor
-            $keep = @($sd.DACL | Where-Object { $_.Trustee.SIDString -ne $sid })
-            if ($keep.Count -eq @($sd.DACL).Count) { return 'none' }
-            $sd.DACL = [System.Management.ManagementBaseObject[]]@($keep | ForEach-Object { $_.psobject.ImmediateBaseObject })
-            $res = Invoke-WmiMethod @sys -Name SetSecurityDescriptor -ArgumentList $sd.psobject.ImmediateBaseObject
-            if ($res.ReturnValue -ne 0) { throw "SetSecurityDescriptor returned $($res.ReturnValue)" }
+            $out = Invoke-WmiMethod @sys -Name GetSD
+            if ($out.ReturnValue -ne 0) { throw "GetSD returned $($out.ReturnValue)" }
+            $sddl = (New-Object System.Security.AccessControl.RawSecurityDescriptor($out.SD, 0)).GetSddlForm('All')
+            $newSddl = [regex]::Replace($sddl, '\([^()]*;' + [regex]::Escape($sid) + '\)', '')
+            if ($newSddl -eq $sddl) { return 'none' }
+            $raw   = New-Object System.Security.AccessControl.RawSecurityDescriptor($newSddl)
+            $bytes = New-Object byte[] ($raw.BinaryLength)
+            $raw.GetBinaryForm($bytes, 0)
+            $res = Invoke-WmiMethod @sys -Name SetSD -ArgumentList (,$bytes)
+            if ($res.ReturnValue -ne 0) { throw "SetSD returned $($res.ReturnValue)" }
             'removed'
         }
         Good "$t - $(if ($r -eq 'none') { 'nothing to remove' } else { 'account removed from the Root namespace' })"
