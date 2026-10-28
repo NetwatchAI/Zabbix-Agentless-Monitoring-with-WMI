@@ -23,8 +23,10 @@ No WMI traffic leaves the client's network. The only outbound connection is the 
 | File | Runs on | Purpose |
 | --- | --- | --- |
 | `install.sh` | Watchnode | Installs the WMI connector and credential wrapper; optionally imports the templates |
+| `uninstall.sh` | Watchnode | Removes what `install.sh` installed |
 | `ntwwmi-auth` | Watchnode | Credential wrapper called by the templates (also embedded in `install.sh`) |
 | `setup-netwatch-access.ps1` | Client DC | Opens the firewall for the Watchnode and grants the read-only account its permissions |
+| `remove-netwatch-access.ps1` | Client DC | Undoes the setup script |
 | `template_member_netwatch_wmi.json` | Netwatch Server | **Windows by Netwatch WMI**: CPU, memory, disks, network, services, uptime |
 | `template_dc_netwatch_wmi.json` | Netwatch Server | **Windows AD DS by Netwatch WMI**: NTDS, DNS, LDAP, replication, member-server discovery |
 | `template_eventlogs_netwatch_wmi.json` | Netwatch Server | **Windows Event Logs by Netwatch WMI**: alerts on selected Windows event IDs |
@@ -60,7 +62,9 @@ Install and import the templates through the Netwatch Server API in one go:
 curl -fsSL https://raw.githubusercontent.com/NetwatchAI/Zabbix-Agentless-Monitoring-with-WMI/main/install.sh | sudo ZBX_URL=https://<netwatch-server>/zabbix ZBX_TOKEN=<api-token> bash
 ```
 
-The templates are downloaded from this repository too. Settings are passed as variables before `bash`:
+The templates are downloaded from this repository too.
+
+Settings are passed as variables before `bash`:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -132,6 +136,30 @@ sudo -u zabbix $W "<user>" "<password>" "<DOMAIN>" -action json -fields Caption 
 
 JSON back means the account, firewall and WMI permissions work. `access denied` means a permission from step 2 is missing on that server.
 
+## Uninstall
+
+Remove in this order, so nothing is left polling.
+
+**1. Netwatch Server:** delete the client's Windows hosts, or unlink the three templates from them with **Unlink and clear**. Delete the templates too if no other client uses them.
+
+**2. Watchnode:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/NetwatchAI/Zabbix-Agentless-Monitoring-with-WMI/main/uninstall.sh | sudo bash
+```
+
+Removes `ntwwmi`, `ntwwmi-auth` and the WMI connector. `python3-impacket` and `fping` are kept (Netwatch ping checks need `fping`); remove impacket with `sudo apt-get remove python3-impacket` if nothing else uses it.
+
+**3. Client domain:** on a DC, as Domain Admin, in an elevated Windows PowerShell 5.1:
+
+```powershell
+.\remove-netwatch-access.ps1 -MonitoringAccount <account>                 # keep the account
+.\remove-netwatch-access.ps1 -MonitoringAccount <account> -DeleteAccount  # also delete it
+.\remove-netwatch-access.ps1 -FirewallOnly                                # set up with -FirewallOnly
+```
+
+It deletes the firewall GPO and the Netwatch rules on every server, removes the account from the three groups, removes its WMI permission, and removes only the Netwatch entry from the service permissions. Audit policy is left as it is, since other tools may rely on it. Like the setup script it ends with a per-server summary and is safe to re-run.
+
 ## Event-log monitoring
 
 The event-log template creates one item per log and event ID listed in `{$WINLOG.EVENTS}`:
@@ -164,4 +192,6 @@ Security events only appear when auditing is on; step 5 of the setup script hand
 | Event-log items empty | No matching events yet, or auditing off | Check `auditpol /get /category:*` on the DC |
 | Timeout / no data | Firewall or network path blocked | Test TCP 135 from the Watchnode to the server |
 | `rpc_s_access_denied` on a member server | Account permissions not set on that server | Rerun the setup script (member servers are included by default); check its row in the summary |
+| Member servers discovered without hosts | The Watchnode cannot reach the DC's DNS (UDP 53) | Allow DNS from the Watchnode to the DCs; `dig +short <server>.<domain> @<DC-IP>` on the Watchnode should return an IP |
 | `WBEM_E_INVALID_QUERY` in an item test | `{#EVENTLOG}` / `{#EVENTID}` empty in the test dialog | Fill them in under Macros before testing |
+
