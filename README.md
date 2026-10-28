@@ -106,11 +106,7 @@ Every step checks first, so re-running is safe. It ends with a per-server summar
 
 Each DC in a different domain: run the script once in each domain.
 
-Undo the service permission change - on that server, in an elevated PowerShell:
-
-```powershell
-sc.exe sdset scmanager (Get-Content C:\ProgramData\Netwatch\scmanager-backup.txt)
-```
+To undo everything, see [Uninstall](#uninstall).
 
 ### 3. Add the hosts in Netwatch
 
@@ -210,4 +206,5 @@ Security events only appear when auditing is on; step 5 of the setup script hand
 | Member servers discovered without hosts | The Watchnode cannot reach the DC's DNS (UDP 53) | Allow DNS from the Watchnode to the DCs; `dig +short <server>.<domain> @<DC-IP>` on the Watchnode should return an IP |
 | Setup summary shows FAILED or PENDING for a server | The DC cannot reach it over WinRM | Run `Test-WSMan <server>` on the DC; enable WinRM (`Enable-PSRemoting`) on that server and rerun the script |
 | A WMI test hangs, then times out | Firewall rules not on that server yet | Rerun the setup script, or run `gpupdate /target:computer /force` on that server |
+| Need the details of a past setup or removal run | Every run is logged on the DC | `C:\Temp\netwatch_wmi_installer.log` (setup) or `C:\Temp\netwatch_wmi_remove.log` (removal) |
 | `WBEM_E_INVALID_QUERY` in an item test | `{#EVENTLOG}` / `{#EVENTID}` empty in the test dialog | Fill them in under Macros before testing |
