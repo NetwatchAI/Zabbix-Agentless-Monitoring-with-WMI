@@ -2718,7 +2718,7 @@
                     {
                         "macro": "{$WMI.DOMAIN}",
                         "value": "",
-                        "description": "Short (NetBIOS) domain name, e.g. MAMBA. Set on the DC host."
+                        "description": "Short (NetBIOS) domain name, e.g. CONTOSO. Set on the DC host."
                     },
                     {
                         "macro": "{$WMI.NODATA_TIMEOUT}",
