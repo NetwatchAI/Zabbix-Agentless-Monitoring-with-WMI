@@ -35,7 +35,7 @@ No WMI traffic leaves the client's network. The only outbound connection is the 
 **Watchnode**
 - Ubuntu or Debian with the Netwatch Watchnode installed
 - Outbound TCP 10051 to the Netwatch Server
-- Network access to the Windows servers on TCP 135, TCP 49152–65535 and ICMP
+- Network access to the Windows servers on TCP 135, TCP 49152–65535 and ICMP, and to the DCs on DNS (UDP 53) for member-server discovery
 
 **Client domain**
 - Windows Server 2012 or newer
@@ -46,59 +46,65 @@ No WMI traffic leaves the client's network. The only outbound connection is the 
 
 ### 1. Install on the Watchnode
 
+Run on the Watchnode; it downloads and runs the installer straight from this repository:
+
 ```bash
-sudo bash install.sh
+curl -fsSL https://raw.githubusercontent.com/NetwatchAI/Zabbix-Agentless-Monitoring-with-WMI/main/install.sh | sudo bash
 ```
 
 It finds the Watchnode configuration and external scripts folder, installs the packages, installs a pinned version of the WMI connector as `ntwwmi`, installs `ntwwmi-auth`, checks both run as the `zabbix` user, and checks that the Netwatch Server is reachable.
 
-Optional: import the templates through the API at the same time.
+Install and import the templates through the Netwatch Server API in one go:
 
 ```bash
-sudo ZBX_URL=https://<netwatch-server>/zabbix ZBX_TOKEN=<api-token> bash install.sh
+curl -fsSL https://raw.githubusercontent.com/NetwatchAI/Zabbix-Agentless-Monitoring-with-WMI/main/install.sh | sudo ZBX_URL=https://<netwatch-server>/zabbix ZBX_TOKEN=<api-token> bash
 ```
+
+The templates are downloaded from this repository too. Settings are passed as variables before `bash`:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `ZBX_URL` / `ZBX_TOKEN` | empty | Netwatch Server API, for template import |
 | `ZABBIX_CONF` | auto (`zabbix_proxy.conf`, then `zabbix_server.conf`) | Config file to read the external scripts folder from |
 | `ZBXWMI_REF` | pinned commit | WMI connector version to install |
-| `ZBX_URL` / `ZBX_TOKEN` | empty | Netwatch Server API, for template import |
-| `TEMPLATE_DIR` | script folder | Where the template JSON files are |
 
-Safe to run again; it updates what is there and skips what is done.
+Run the same command again to update: it replaces the scripts with the latest version from this repository and skips what is already done.
 
 ### 2. Prepare the client domain
 
 Run once per domain, on a domain controller, signed in as Domain Admin, in an elevated **Windows PowerShell 5.1**:
 
 ```powershell
+Invoke-WebRequest https://raw.githubusercontent.com/NetwatchAI/Zabbix-Agentless-Monitoring-with-WMI/main/setup-netwatch-access.ps1 -OutFile setup-netwatch-access.ps1 -UseBasicParsing
 Unblock-File .\setup-netwatch-access.ps1
 .\setup-netwatch-access.ps1 -ProxyServer <WATCHNODE-IP> -MonitoringAccount <account>
 ```
 
+No internet on the DC? Copy `setup-netwatch-access.ps1` over and skip the first line. `<WATCHNODE-IP>` is the Watchnode's address on the client's network.
+
 | Step | What it does | Applies to |
 | --- | --- | --- |
-| 1. Firewall | Domain GPO allowing WMI and ping **from the Watchnode IP only**; applied to this DC, pushed to every server and verified on TCP 135 | All servers |
-| 2. Groups | Adds the account to Distributed COM Users, Performance Monitor Users, Event Log Readers | DCs (+ member servers) |
-| 3. WMI | Enable Account + Remote Enable on the Root namespace, inherited by all child namespaces | DCs (+ member servers) |
-| 4. Services | Read-only access to the Service Control Manager; original permissions backed up to `netwatch-backup\` | DCs (+ member servers) |
+| 1. Firewall | Domain GPO allowing WMI and ping **from the Watchnode IP only**; applied to this DC, pushed to every server, and the active rules checked on each | All servers |
+| 2. Groups | Adds the account to Distributed COM Users, Performance Monitor Users, Event Log Readers | All servers (DCs and member servers) |
+| 3. WMI | Enable Account + Remote Enable on the Root namespace, inherited by all child namespaces | All servers (DCs and member servers) |
+| 4. Services | Read-only access to the Service Control Manager; original permissions backed up on each server to `C:\ProgramData\Netwatch\` | All servers (DCs and member servers) |
 | 5. Audit | Turns on the audit subcategories for the monitored security event IDs | DCs |
 
 Every step checks first, so re-running is safe. It ends with a per-server summary.
 
 | Option | Use when |
 | --- | --- |
-| `-IncludeMemberServers` | Member servers are monitored with the read-only account too (uses WinRM) |
+| `-DCsOnly` | Set permissions on domain controllers only (member servers are included by default, through WinRM) |
 | `-FirewallOnly` | Monitoring with a Domain Admin account; skips steps 2–5 |
 | `-SkipAuditPolicy` | The client manages audit policy themselves |
 | `-ProxyServer <ip1>,<ip2>` | More than one Watchnode |
 
 Each DC in a different domain: run the script once in each domain.
 
-Undo the service permission change on a server:
+Undo the service permission change - on that server, in an elevated PowerShell:
 
 ```powershell
-sc.exe \\<server> sdset scmanager (Get-Content .\netwatch-backup\scmanager-<server>.txt)
+sc.exe sdset scmanager (Get-Content C:\ProgramData\Netwatch\scmanager-backup.txt)
 ```
 
 ### 3. Add the hosts in Netwatch
@@ -157,5 +163,5 @@ Security events only appear when auditing is on; step 5 of the setup script hand
 | `access denied` on service items only | Service Control Manager permission missing | Check the Services column |
 | Event-log items empty | No matching events yet, or auditing off | Check `auditpol /get /category:*` on the DC |
 | Timeout / no data | Firewall or network path blocked | Test TCP 135 from the Watchnode to the server |
+| `rpc_s_access_denied` on a member server | Account permissions not set on that server | Rerun the setup script (member servers are included by default); check its row in the summary |
 | `WBEM_E_INVALID_QUERY` in an item test | `{#EVENTLOG}` / `{#EVENTID}` empty in the test dialog | Fill them in under Macros before testing |
-
