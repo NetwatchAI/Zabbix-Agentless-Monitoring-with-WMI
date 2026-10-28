@@ -57,6 +57,52 @@ def query(cred, target, *args):
     return last_json(p.stdout)
 
 
+def dns_a(server, name, timeout=3):
+    """Ask one DNS server for the A record of name (UDP 53). Returns an IP or ''."""
+    import random, struct
+    qid = random.randint(0, 0xFFFF)
+    q = struct.pack('>HHHHHH', qid, 0x0100, 1, 0, 0, 0)
+    for label in name.rstrip('.').split('.'):
+        q += bytes([len(label)]) + label.encode()
+    q += b'\x00' + struct.pack('>HH', 1, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(q, (server, 53))
+        data = s.recv(4096)
+    except OSError:
+        return ''
+    finally:
+        s.close()
+    if len(data) < 12 or struct.unpack('>H', data[:2])[0] != qid:
+        return ''
+    ancount = struct.unpack('>H', data[6:8])[0]
+
+    def skip_name(i):
+        while i < len(data):
+            n = data[i]
+            if n == 0:
+                return i + 1
+            if n & 0xC0 == 0xC0:
+                return i + 2
+            i += n + 1
+        return i
+
+    i = skip_name(12) + 4
+    for _ in range(ancount):
+        i = skip_name(i)
+        if i + 10 > len(data):
+            break
+        rtype, _, _, rdlen = struct.unpack('>HHIH', data[i:i + 10])
+        i += 10
+        if rtype == 1 and rdlen == 4:
+            ip = socket.inet_ntoa(data[i:i + 4])
+            if not ip.startswith('169.254.'):
+                return ip
+        i += rdlen
+    return ''
+
+
 def members(cred, target):
     try:
         computers = query(cred, target, '-key', 'DS_cn', '-namespace', '//./root/directory/LDAP',
@@ -87,8 +133,7 @@ def members(cred, target):
                 last_error = e
         if records is None:
             # Usually access denied: the DNS WMI provider only answers DnsAdmins.
-            # Fall back to the Watchnode's own DNS below; never print here, the
-            # output must stay pure JSON.
+            # Resolved below instead; never print here, output must stay pure JSON.
             continue
         for r in records:
             name = str(r.get('OwnerName') or '').lower().rstrip('.')
@@ -96,10 +141,19 @@ def members(cred, target):
             if name and ip and not ip.startswith('169.254.') and name not in ips:
                 ips[name] = ip
 
+    # IPs the DNS WMI provider did not give (read-only accounts are refused):
+    # 1) ask the DC's own DNS service directly - the target is the DC,
+    # 2) then the Watchnode's resolver.
+    try:
+        dc_ip = socket.gethostbyname(target)
+    except OSError:
+        dc_ip = ''
     socket.setdefaulttimeout(3)
     for c in computers:
         name = dns_name(c)
         ip = ips.get(name, '')
+        if not ip and name and dc_ip:
+            ip = dns_a(dc_ip, name)
         if not ip and name:
             try:
                 ip = socket.gethostbyname(name)
