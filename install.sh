@@ -1,16 +1,41 @@
 #!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# install.sh - one-shot setup of agentless Windows/AD monitoring on an Ubuntu
+# Netwatch agentless WMI setup: installs ntwwmi, ntwwmi-auth, fping, and (optionally) the template.
+#
+# Repo: set your own; pass REPO_RAW or edit the default below
+#
+# Install:
+#   curl -fsSL https://<your-repo>/install.sh | sudo bash
+#
+# Install and import/update the template through the Zabbix API (Zabbix is the engine underneath):
+#   curl -fsSL https://<your-repo>/install.sh | \
+#     sudo ZBX_URL=http://<zabbix-server>/zabbix ZBX_TOKEN=<api-token> bash
+#
+# Safe to run again: it updates what is there and skips what is done.
+# ---------------------------------------------------------------------------
 set -euo pipefail
 
-CONF="${ZABBIX_CONF:-/etc/zabbix/zabbix_server.conf}"
-ZBX_URL="${ZBX_URL:-}"
-ZBX_TOKEN="${ZBX_TOKEN:-}"
+ZBX_URL="${ZBX_URL:-}"             # URL you open Zabbix with, e.g. http://10.0.0.5/zabbix
+ZBX_TOKEN="${ZBX_TOKEN:-}"         # Zabbix API token (Users > API tokens)
+REPO_RAW="${REPO_RAW:-https://<your-repo>}"
+TEMPLATE_DIR="${TEMPLATE_DIR:-}"   # folder holding the template JSON files (defaults to this script's folder)
+CONF="${ZABBIX_CONF:-}"            # auto: Watchnode (proxy) config first, then server config
+ZBXWMI_REF="${ZBXWMI_REF:-77016eec84010c5eb4e66214599e56755794cc35}"  # pinned, reviewed version of the WMI connector
 
 step() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 ok()   { printf '    \033[32mOK\033[0m %s\n' "$*"; }
 die()  { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "run as root: sudo bash install.sh"
-id zabbix >/dev/null 2>&1 || die "user 'zabbix' not found - install Zabbix server first"
+id zabbix >/dev/null 2>&1 || die "user 'zabbix' not found - install the Netwatch Watchnode (Zabbix proxy) first"
+
+if [ -z "$CONF" ]; then
+  for c in /etc/zabbix/zabbix_proxy.conf /etc/zabbix/zabbix_server.conf; do
+    [ -f "$c" ] && { CONF="$c"; break; }
+  done
+fi
+CONF="${CONF:-/etc/zabbix/zabbix_proxy.conf}"
 
 step "Checking the operating system"
 . /etc/os-release
@@ -35,19 +60,21 @@ apt-get install -y -qq python3 python3-impacket git fping curl ca-certificates s
 python3 -c 'import impacket' || die "python3-impacket did not install correctly"
 ok "packages installed"
 
-# Netwatch looks for fping in /usr/sbin by default; Ubuntu installs it in /usr/bin
+# Zabbix looks for fping in /usr/sbin by default; Ubuntu installs it in /usr/bin
 if [ ! -e /usr/sbin/fping ] && [ -x /usr/bin/fping ]; then
   ln -s /usr/bin/fping /usr/sbin/fping
   ok "linked /usr/sbin/fping -> /usr/bin/fping"
 fi
 
 step "Installing ntwwmi (WMI connector)"
-if [ -d /opt/zbxwmi/.git ]; then
-  git -C /opt/zbxwmi pull -q
-else
+if [ ! -d /opt/zbxwmi/.git ]; then
   rm -rf /opt/zbxwmi
   git clone -q https://github.com/13hakta/zbxwmi.git /opt/zbxwmi
 fi
+# Use the exact reviewed version, never whatever is newest upstream
+git -C /opt/zbxwmi fetch -q origin || die "could not download the WMI connector from GitHub"
+git -C /opt/zbxwmi -c advice.detachedHead=false checkout -q "$ZBXWMI_REF" \
+  || die "WMI connector version $ZBXWMI_REF not found"
 install -o zabbix -g zabbix -m 755 /opt/zbxwmi/zbxwmi "$DIR/ntwwmi"
 sed -i 's/\r$//' "$DIR/ntwwmi"
 ok "$DIR/ntwwmi"
@@ -241,8 +268,6 @@ def logs_discovery(enabled, spec):
             continue
         logname, _, idlist = block.partition('=')
         logname = logname.strip()
-        if logname.startswith('#') or logname.startswith('!'):
-            continue   # category turned off (prefix '#'); its IDs are kept for later
         table = EVENT_NAMES.get(logname, {})
         for raw in idlist.split(','):
             part = raw.strip()
@@ -263,31 +288,9 @@ def logs_discovery(enabled, spec):
     return 0
 
 
-def logs_discovery2(master, flat, extra):
-    """Per-category log template. MASTER is the global on/off. FLAT is a flat list of
-    (LogName, ENABLED, EVENTS) triples - one per category, each with its own toggle.
-    EXTRA is an optional combined 'Log=ids;Log=ids' spec for any other classic log.
-    Builds a single spec from the categories whose ENABLED is on, then reuses the
-    normal parser (names, 'id:Label', '#' disable all apply)."""
-    import json as _json
-    if str(master).strip().lower() not in ('1', 'true', 'yes', 'on'):
-        print(_json.dumps([])); return 0
-    on = ('1', 'true', 'yes', 'on')
-    parts = []
-    for i in range(0, len(flat) - 2, 3):
-        name = flat[i].strip()
-        enabled = flat[i + 1].strip().lower()
-        events = flat[i + 2].strip()
-        if enabled in on and events and not events.startswith('{$'):
-            parts.append('%s=%s' % (name, events))
-    if extra and not extra.strip().startswith('{$'):
-        parts.append(extra.strip())
-    return logs_discovery('1', ';'.join(parts))
-
-
 def main():
     if len(sys.argv) < 5:
-        fail('usage: ntwwmi-auth USER PASSWORD DOMAIN <ntwwmi args> | -members TARGET | -events LOG IDLIST | -logs ENABLED SPEC | -logs2 ENABLED [Name EN EVENTS ...] EXTRA')
+        fail('usage: ntwwmi-auth USER PASSWORD DOMAIN <ntwwmi args> | -members TARGET | -events LOG IDLIST | -logs ENABLED SPEC')
     user, password, domain = sys.argv[1:4]
     args = sys.argv[4:]
     if not user or not password or user.startswith('{$') or password.startswith('{$'):
@@ -311,11 +314,6 @@ def main():
             if len(args) < 3:
                 fail('usage: -logs ENABLED "Log=id,id;Log=id:Label"')
             return logs_discovery(args[1], args[2])
-        if args[0] == '-logs2':
-            # -logs2 ENABLED [Name EN EVENTS ...] EXTRA  (per-category toggles)
-            if len(args) < 3:
-                fail('usage: -logs2 ENABLED [Name EN EVENTS ...] EXTRA')
-            return logs_discovery2(args[1], args[2:-1], args[-1])
         # -tag VALUE is a key-disambiguator only (makes per-log prototype keys unique);
         # strip it so the WMI engine never sees it.
         if '-tag' in args:
@@ -323,8 +321,6 @@ def main():
             del args[ti:ti+2]
         p = subprocess.run([NTWWMI, '-cred', cred] + args, capture_output=True, text=True, timeout=TIMEOUT)
         sys.stdout.write(p.stdout)
-        if p.stderr:
-            sys.stderr.write(p.stderr)
         return p.returncode
     except subprocess.TimeoutExpired:
         fail('ntwwmi timed out after %ss' % TIMEOUT)
@@ -351,65 +347,72 @@ echo "$out" | grep -qi 'usage' || die "ntwwmi-auth did not start as the zabbix u
 $out"
 ok "both scripts start correctly"
 
+step "Checking the connection to the Netwatch Server"
+srv="$(grep -E '^[[:space:]]*Server[[:space:]]*=' "$CONF" 2>/dev/null | tail -1 | cut -d= -f2- | cut -d, -f1 | xargs || true)"
+mode="$(grep -E '^[[:space:]]*ProxyMode[[:space:]]*=' "$CONF" 2>/dev/null | tail -1 | cut -d= -f2- | xargs || true)"
+if [ -z "$srv" ] || [ "${mode:-0}" != "0" ] || [ "$(basename "$CONF")" != "zabbix_proxy.conf" ]; then
+  printf '    \033[33mSKIP\033[0m not an active Watchnode config (%s) - not checked\n' "$CONF"
+else
+  host="${srv%:*}"; port=10051
+  [ "$host" != "$srv" ] && port="${srv##*:}"
+  if timeout 5 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
+    ok "Netwatch Server $host:$port is reachable"
+  else
+    printf '    \033[33mWARN\033[0m cannot reach Netwatch Server %s:%s - check the outbound firewall (TCP %s)\n' "$host" "$port" "$port"
+  fi
+fi
+
 if [ -n "$ZBX_URL" ] && [ -n "$ZBX_TOKEN" ]; then
-  step "Importing Netwatch templates via API"
+  step "Importing templates through the Zabbix API"
+  TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
   import_one() {
-    local file="$1"
-    [ -f "$file" ] || { printf '    \033[33mSKIP\033[0m %s not found\n' "$file"; return; }
-    python3 - "$ZBX_URL" "$ZBX_TOKEN" "$file" <<'PYEOF'
-import sys, json, urllib.request, urllib.parse
-
-url, token, path = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(path) as f:
-    source = f.read()
-
-payload = {
-    "jsonrpc": "2.0", "id": 1, "method": "configuration.import",
-    "params": {
-        "format": "json",
-        "source": source,
-        "rules": {
-            "templates":        {"createMissing": True,  "updateExisting": True},
-            "items":            {"createMissing": True,  "updateExisting": True, "deleteMissing": False},
-            "triggers":         {"createMissing": True,  "updateExisting": True, "deleteMissing": False},
-            "graphs":           {"createMissing": True,  "updateExisting": True, "deleteMissing": False},
-            "discoveryRules":   {"createMissing": True,  "updateExisting": True, "deleteMissing": False},
-            "itemPrototypes":   {"createMissing": True,  "updateExisting": True, "deleteMissing": False},
-            "triggerPrototypes":{"createMissing": True,  "updateExisting": True, "deleteMissing": False},
-            "graphPrototypes":  {"createMissing": True,  "updateExisting": True, "deleteMissing": False},
-            "httptests":        {"createMissing": True,  "updateExisting": True, "deleteMissing": False},
-            "valueMaps":        {"createMissing": True,  "updateExisting": True}
-        }
-    }
+    local name="$1" src=""
+    if [ -n "$TEMPLATE_DIR" ] && [ -f "$TEMPLATE_DIR/$name" ]; then
+      src="$TEMPLATE_DIR/$name"
+    elif [ -f "$SCRIPT_DIR/$name" ]; then
+      src="$SCRIPT_DIR/$name"
+    elif [ -n "$REPO_RAW" ]; then
+      curl -fsSL "${REPO_RAW%/}/$name" -o "$TMP/$name" || die "could not download $name from $REPO_RAW"
+      src="$TMP/$name"
+    else
+      die "cannot find $name (set TEMPLATE_DIR or REPO_RAW, or run from the repo clone)"
+    fi
+    python3 - "$src" > "$TMP/request.json" <<'PY_EOF'
+import json, sys
+source = open(sys.argv[1]).read()
+json.loads(source)  # fail early on a broken file
+full = {"createMissing": True, "updateExisting": True, "deleteMissing": True}
+rules = {
+    "template_groups": {"createMissing": True, "updateExisting": True},
+    "templates": {"createMissing": True, "updateExisting": True},
+    "templateLinkage": {"createMissing": True},
+    "items": full, "discoveryRules": full, "triggers": full,
+    "graphs": full, "templateDashboards": full, "valueMaps": full,
 }
-data = json.dumps(payload).encode()
-req = urllib.request.Request(url.rstrip('/') + '/api_jsonrpc.php',
-    data=data,
-    headers={"Content-Type": "application/json", "Authorization": "Bearer " + token})
-with urllib.request.urlopen(req, timeout=30) as r:
-    resp = json.load(r)
-if "error" in resp:
-    print("ERROR:", resp["error"].get("data", resp["error"]))
-    sys.exit(1)
-print("imported:", path)
-PYEOF
+print(json.dumps({"jsonrpc": "2.0", "method": "configuration.import", "id": 1,
+                  "params": {"format": "json", "source": source, "rules": rules}}))
+PY_EOF
+    resp="$(curl -sS -X POST "${ZBX_URL%/}/api_jsonrpc.php" \
+              -H 'Content-Type: application/json-rpc' \
+              -H "Authorization: Bearer $ZBX_TOKEN" \
+              --data @"$TMP/request.json")" || die "could not reach ${ZBX_URL%/}/api_jsonrpc.php"
+    echo "$resp" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("result") is True else 1)' \
+      || die "import of $name failed: $resp"
+    ok "imported $name"
   }
 
-  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  for tmpl in \
-    "$SCRIPT_DIR/template_dc_netwatch_wmi.json" \
-    "$SCRIPT_DIR/template_member_netwatch_wmi.json" \
-    "$SCRIPT_DIR/template_eventlogs_netwatch_wmi.json"
-  do
-    import_one "$tmpl"
-  done
-  ok "template import done"
+  # Order matters: the member template must exist before the DC template links it.
+  import_one template_member_netwatch_wmi.json
+  import_one template_dc_netwatch_wmi.json
+  import_one template_eventlogs_netwatch_wmi.json
+  ok "all templates imported (member, DC, event logs)"
 else
-  printf '    \033[33mSKIP\033[0m set ZBX_URL and ZBX_TOKEN to import templates automatically\n'
+  step "Skipping template import (ZBX_URL / ZBX_TOKEN not set): import them in the web interface"
 fi
 
 printf '\n\033[1;32mDone.\033[0m This server is ready for Netwatch agentless Windows/AD monitoring.\n\n'
 printf 'Test against a client DC:\n'
-printf "  sudo -u zabbix %s/ntwwmi-auth <admin-user> '<password>' <DOMAIN> -action get -fields Caption Win32_OperatingSystem <DC-IP>\n\n" "$DIR"
-printf 'Then import the templates in the Netwatch web interface and onboard the client (guide, Part 3).\n'
+printf "  sudo -u zabbix %s/ntwwmi-auth <monitoring-user> '<password>' <DOMAIN> -action get -fields Caption Win32_OperatingSystem <DC-IP>\n\n" "$DIR"
+printf 'Then add the hosts in Netwatch, set "Monitored by" to this Watchnode, and link the templates.\n'

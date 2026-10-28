@@ -1,0 +1,147 @@
+{
+    "zabbix_export": {
+        "version": "7.4",
+        "template_groups": [
+            {
+                "uuid": "b1a65eeba3cc4c9fb198e8f18f433839",
+                "name": "Templates/Operating Systems"
+            }
+        ],
+        "templates": [
+            {
+                "uuid": "95bb08b1b2874be3842e56f11ecb5f95",
+                "template": "Windows Event Logs by Netwatch WMI",
+                "name": "Windows Event Logs by Netwatch WMI",
+                "description": "Optional Windows event-log monitoring (agentless WMI). Attach only to hosts that need log monitoring; it works alongside the Windows by Netwatch WMI template (which supplies the WMI credentials) or standalone if the {$WMI.*} macros are set here.\n\nConfigure everything with two macros:\n  {$WINLOG.ENABLED} = 1 to collect, 0 to turn all log monitoring off.\n  {$WINLOG.EVENTS}  = the logs and event IDs to watch.\nFormat: Log=id,id;Log=id:Custom name,id   (';' between logs, ',' between IDs, optional 'id:Label' to name an item). Add any CLASSIC log by adding it here.\n\nLIMITATION: only classic logs are reachable over WMI (System, Application, Security, Setup, Directory Service, DFS Replication, DNS Server, Windows PowerShell, etc.). Nested 'Applications and Services Logs' channels (Microsoft-Windows-*/Operational) CANNOT be read agentless - they require the Zabbix agent.",
+                "groups": [
+                    {
+                        "name": "Templates/Operating Systems"
+                    }
+                ],
+                "macros": [
+                    {
+                        "macro": "{$WMI.USER}",
+                        "value": "",
+                        "description": "WMI account (no domain prefix). Usually inherited from the Windows template on the host."
+                    },
+                    {
+                        "macro": "{$WMI.PASSWORD}",
+                        "type": "SECRET_TEXT",
+                        "value": "",
+                        "description": "Password for {$WMI.USER}. Usually inherited from the Windows template on the host."
+                    },
+                    {
+                        "macro": "{$WMI.DOMAIN}",
+                        "value": "",
+                        "description": "Short NetBIOS domain, e.g. CONTOSO. Usually inherited from the Windows template on the host."
+                    },
+                    {
+                        "macro": "{$WINLOG.ENABLED}",
+                        "value": "1",
+                        "description": "1 = collect event logs, 0 = turn all log monitoring off (items are removed after the lost-resources period)."
+                    },
+                    {
+                        "macro": "{$WINLOG.EVENTS}",
+                        "value": "System=6008,41,51,7031,7045;Application=1000,1002;Security=1102,4740,4728,4732,4720,4726",
+                        "description": "Logs and event IDs to monitor. Format: Log=id,id;Log=id:Label,id . Classic logs only."
+                    }
+                ],
+                "discovery_rules": [
+                    {
+                        "uuid": "8f5b0876c3204c67a6d26c6dbd4f1d6f",
+                        "name": "Windows event log discovery",
+                        "type": "EXTERNAL",
+                        "key": "ntwwmi-auth[\"{$WMI.USER}\",\"{$WMI.PASSWORD}\",\"{$WMI.DOMAIN}\",\"-logs\",\"{$WINLOG.ENABLED}\",\"{$WINLOG.EVENTS}\"]",
+                        "delay": "1h",
+                        "lifetime": "1d",
+                        "description": "Creates one item per (log, event ID) listed in {$WINLOG.EVENTS}. Edit that macro to add or remove logs/IDs; set {$WINLOG.ENABLED}=0 to stop all of it.",
+                        "item_prototypes": [
+                            {
+                                "uuid": "116980d4e2e444d998fe18550aa51354",
+                                "name": "Event {#EVENTLOG} {#EVENTID}{#EVENTNAME}",
+                                "type": "EXTERNAL",
+                                "key": "ntwwmi-auth[\"{$WMI.USER}\",\"{$WMI.PASSWORD}\",\"{$WMI.DOMAIN}\",\"-action\",\"get\",\"-tag\",\"{#EVENTLOG}\",\"-key\",\"RecordNumber\",\"-fields\",\"RecordNumber\",\"-filter\",\"Logfile='{#EVENTLOG}' AND EventCode={#EVENTID}\",\"Win32_NTLogEvent\",{HOST.CONN},{HOST.CONN}]",
+                                "delay": "5m",
+                                "history": "7d",
+                                "trends": "0",
+                                "value_type": "CHAR",
+                                "timeout": "30s",
+                                "description": "Newest RecordNumber for this event ID in this log. It changes when a new matching event occurs; the trigger prototype alerts on that change.",
+                                "preprocessing": [
+                                    {
+                                        "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                                        "parameters": [
+                                            "6h"
+                                        ]
+                                    }
+                                ],
+                                "trigger_prototypes": [
+                                    {
+                                        "uuid": "bbdfff9b0e92459587ba38bfd81d6237",
+                                        "expression": "change(/Windows Event Logs by Netwatch WMI/ntwwmi-auth[\"{$WMI.USER}\",\"{$WMI.PASSWORD}\",\"{$WMI.DOMAIN}\",\"-action\",\"get\",\"-tag\",\"{#EVENTLOG}\",\"-key\",\"RecordNumber\",\"-fields\",\"RecordNumber\",\"-filter\",\"Logfile='{#EVENTLOG}' AND EventCode={#EVENTID}\",\"Win32_NTLogEvent\",{HOST.CONN},{HOST.CONN}])<>0",
+                                        "name": "Event {#EVENTLOG} {#EVENTID}{#EVENTNAME} detected on {HOST.NAME}",
+                                        "priority": "WARNING",
+                                        "type": "MULTIPLE",
+                                        "manual_close": "YES",
+                                        "description": "Fires when a new matching event is logged. Disable this prototype if you only want to collect events without alerting.",
+                                        "tags": [
+                                            {
+                                                "tag": "component",
+                                                "value": "eventlog"
+                                            },
+                                            {
+                                                "tag": "logfile",
+                                                "value": "{#EVENTLOG}"
+                                            },
+                                            {
+                                                "tag": "event_id",
+                                                "value": "{#EVENTID}"
+                                            }
+                                        ]
+                                    }
+                                ],
+                                "tags": [
+                                    {
+                                        "tag": "component",
+                                        "value": "eventlog"
+                                    },
+                                    {
+                                        "tag": "logfile",
+                                        "value": "{#EVENTLOG}"
+                                    },
+                                    {
+                                        "tag": "event_id",
+                                        "value": "{#EVENTID}"
+                                    }
+                                ]
+                            }
+                        ],
+                        "overrides": [
+                            {
+                                "name": "Critical security events: High severity",
+                                "step": "1",
+                                "filter": {
+                                    "conditions": [
+                                        {
+                                            "macro": "{#EVENTID}",
+                                            "value": "^(1102|4740)$",
+                                            "formulaid": "A"
+                                        }
+                                    ]
+                                },
+                                "operations": [
+                                    {
+                                        "operationobject": "TRIGGER_PROTOTYPE",
+                                        "operator": "LIKE",
+                                        "value": "Event",
+                                        "severity": "HIGH"
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+}
