@@ -2,11 +2,11 @@
   setup-netwatch-access.ps1 - prepares a domain for Netwatch WMI monitoring.
   Run once per domain on a DC, as Domain Admin, in an elevated Windows PowerShell. Safe to re-run.
 
-  .\setup-netwatch-access.ps1 -ProxyServer <WATCHNODE-IP> -MonitoringAccount <account> [-IncludeMemberServers]
+  .\setup-netwatch-access.ps1 -ProxyServer <WATCHNODE-IP> -MonitoringAccount <account> [-DCsOnly]
   .\setup-netwatch-access.ps1 -ProxyServer <WATCHNODE-IP> -FirewallOnly
 
-  Undo the service permission change on a server:
-    sc.exe \\<server> sdset scmanager (Get-Content .\netwatch-backup\scmanager-<server>.txt)
+  Undo the service permission change - on that server, elevated:
+    sc.exe sdset scmanager (Get-Content C:\ProgramData\Netwatch\scmanager-backup.txt)
 #>
 #Requires -Version 5.1
 [CmdletBinding()]
@@ -17,6 +17,8 @@ param(
     [string]$MonitoringAccount,
 
     [switch]$FirewallOnly,
+
+    [switch]$DCsOnly,
 
     [switch]$IncludeMemberServers,
 
@@ -93,7 +95,7 @@ $allMembers = @(try {
 } catch { Warn "could not list member servers: $($_.Exception.Message)" })
 Good ("member servers: {0}" -f $(if ($allMembers) { $allMembers -join ', ' } else { 'none found' }))
 
-$members = if ($IncludeMemberServers) { $allMembers } else { @() }
+$members = if ($DCsOnly) { @() } else { $allMembers }
 $targets = @($dcs) + @($members)
 $thisDc  = $dcs | Where-Object { ($_ -split '\.')[0] -eq $env:COMPUTERNAME } | Select-Object -First 1
 if (-not $thisDc) { $thisDc = $env:COMPUTERNAME }
@@ -168,20 +170,21 @@ Mark $thisDc 'Firewall' 'OK'
 $others = @(@($dcs) + @($allMembers) | Where-Object { $_ -ne $thisDc })
 if ($others.Count -eq 0) {
     Good 'no other servers in the domain'
-} elseif (-not $rulesChanged -and $existing.Count -ge 3) {
-    Good 'rules unchanged - other servers already have them (they keep applying policy on their own)'
-    foreach ($o in $others) { Mark $o 'Firewall' 'OK (unchanged)' }
 } else {
-    Info "pushing policy to $($others.Count) other server(s) and waiting up to $VerifyTimeoutSeconds s..."
-    foreach ($o in $others) {
-        try { Invoke-GPUpdate -Computer $o -Force -RandomDelayInMinutes 0 -ErrorAction Stop | Out-Null } catch { }
+    if ($rulesChanged) {
+        Info "pushing policy to $($others.Count) other server(s)..."
+        foreach ($o in $others) {
+            try { Invoke-GPUpdate -Computer $o -Force -RandomDelayInMinutes 0 -ErrorAction Stop | Out-Null } catch { }
+        }
     }
+    Info "verifying $($others.Count) other server(s), waiting up to $VerifyTimeoutSeconds s..."
+
     function Test-ServerReady([string]$Computer) {
         try {
             $r = Get-NetFirewallRule -CimSession $Computer -PolicyStore ActiveStore -DisplayName 'Netwatch -*' -ErrorAction Stop
             if (@($r).Count -lt 3) { return $false }
+            return $true
         } catch { return $false }
-        return [bool](Test-NetConnection -ComputerName $Computer -Port 135 -WarningAction SilentlyContinue).TcpTestSucceeded
     }
     $deadline = (Get-Date).AddSeconds($VerifyTimeoutSeconds)
     $pending  = [System.Collections.ArrayList]@($others)
@@ -192,7 +195,7 @@ if ($others.Count -eq 0) {
         if ($pending.Count -gt 0) { Start-Sleep -Seconds 5 }
     }
     foreach ($o in $pending) {
-        Warn "$o - not confirmed yet (off or booting?) - it applies the policy on its next refresh"
+        Warn "$o - rules not confirmed (off, booting, or WinRM blocked) - it applies the policy on its next refresh"
         Mark $o 'Firewall' 'PENDING'
     }
 }
@@ -232,56 +235,68 @@ foreach ($m in $members) {
 }
 
 Step '3/5 WMI permissions (Root namespace, inherited)'
-$WBEM_ENABLE        = 0x1
-$WBEM_REMOTE_ACCESS = 0x20
-$wantMask           = $WBEM_ENABLE -bor $WBEM_REMOTE_ACCESS
-$CONTAINER_INHERIT  = 0x2
-
+# Runs on each server through WinRM: remote WMI/RPC from this DC is blocked by
+# the Netwatch firewall rules, which only allow the Watchnode.
+$wmiBlock = {
+    param($sid)
+    $wantMask = 0x21                     # Enable Account + Remote Enable
+    $sys = @{ Namespace = 'root'; Path = '__SystemSecurity=@'; ErrorAction = 'Stop' }
+    $out = Invoke-WmiMethod @sys -Name GetSecurityDescriptor
+    if ($out.ReturnValue -ne 0) { throw "GetSecurityDescriptor returned $($out.ReturnValue)" }
+    $sd = $out.Descriptor
+    $already = $sd.DACL | Where-Object {
+        $_.Trustee.SIDString -eq $sid -and $_.AceType -eq 0 -and
+        (($_.AccessMask -band $wantMask) -eq $wantMask) -and (($_.AceFlags -band 0x2) -ne 0)
+    }
+    if ($already) { return 'already' }
+    $trustee = ([wmiclass]'Win32_Trustee').CreateInstance()
+    $trustee.SIDString = $sid
+    $ace = ([wmiclass]'Win32_ACE').CreateInstance()
+    $ace.AccessMask = $wantMask
+    $ace.AceFlags   = 0x2                # inherited by child namespaces
+    $ace.AceType    = 0
+    $ace.Trustee    = $trustee
+    $sd.DACL += $ace.psobject.ImmediateBaseObject
+    $res = Invoke-WmiMethod @sys -Name SetSecurityDescriptor -ArgumentList $sd.psobject.ImmediateBaseObject
+    if ($res.ReturnValue -ne 0) { throw "SetSecurityDescriptor returned $($res.ReturnValue)" }
+    'set'
+}
 foreach ($t in $targets) {
     try {
-        $sys = @{ Namespace = 'root'; Path = '__SystemSecurity=@'; ComputerName = $t; ErrorAction = 'Stop' }
-        $out = Invoke-WmiMethod @sys -Name GetSecurityDescriptor
-        if ($out.ReturnValue -ne 0) { throw "GetSecurityDescriptor returned $($out.ReturnValue)" }
-        $sd = $out.Descriptor
-
-        $already = $sd.DACL | Where-Object {
-            $_.Trustee.SIDString -eq $acctSid -and $_.AceType -eq 0 -and
-            (($_.AccessMask -band $wantMask) -eq $wantMask) -and (($_.AceFlags -band $CONTAINER_INHERIT) -ne 0)
-        }
-        if ($already) { Good "$t - already set"; Mark $t 'WMI' 'OK'; continue }
-
-        $trustee = ([wmiclass]'Win32_Trustee').CreateInstance()
-        $trustee.SIDString = $acctSid
-        $ace = ([wmiclass]'Win32_ACE').CreateInstance()
-        $ace.AccessMask = $wantMask
-        $ace.AceFlags   = $CONTAINER_INHERIT
-        $ace.AceType    = 0
-        $ace.Trustee    = $trustee
-        $sd.DACL += $ace.psobject.ImmediateBaseObject
-
-        $res = Invoke-WmiMethod @sys -Name SetSecurityDescriptor -ArgumentList $sd.psobject.ImmediateBaseObject
-        if ($res.ReturnValue -ne 0) { throw "SetSecurityDescriptor returned $($res.ReturnValue)" }
-        Good "$t - Enable Account + Remote Enable granted"; Mark $t 'WMI' 'OK'
+        $r = Invoke-Command -ComputerName $t -ErrorAction Stop -ScriptBlock $wmiBlock -ArgumentList $acctSid
+        if ($r -eq 'already') { Good "$t - already set" } else { Good "$t - Enable Account + Remote Enable granted" }
+        Mark $t 'WMI' 'OK'
     } catch { Warn "$t - $($_.Exception.Message)"; Mark $t 'WMI' 'FAILED' }
 }
 
 Step '4/5 Service permissions (read-only, Service Control Manager)'
 # CC = connect, LC = list services, RP = read status, RC = read permissions. No start/stop/change.
-$scmAce = "(A;;CCLCRPRC;;;$acctSid)"
+$scmBlock = {
+    param($sid)
+    $old = ((& sc.exe sdshow scmanager) | Where-Object { $_ -and $_.Trim() }) -join ''
+    if ($LASTEXITCODE -ne 0 -or $old -notmatch '^D:') { throw "could not read permissions: $old" }
+    if ($old.Contains($sid)) { return @('already', $old) }
+    $dir = Join-Path $env:ProgramData 'Netwatch'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $backup = Join-Path $dir 'scmanager-backup.txt'
+    if (-not (Test-Path $backup)) { Set-Content -Path $backup -Value $old -Encoding ASCII }
+    $ace = "(A;;CCLCRPRC;;;$sid)"
+    $idx = $old.IndexOf('S:')
+    $new = if ($idx -ge 0) { $old.Insert($idx, $ace) } else { $old + $ace }
+    $res = & sc.exe sdset scmanager $new
+    if ($LASTEXITCODE -ne 0) { throw "sdset failed: $res" }
+    @('set', $old)
+}
 foreach ($t in $targets) {
     try {
-        $old = ((& sc.exe "\\$t" sdshow scmanager) | Where-Object { $_ -and $_.Trim() }) -join ''
-        if ($LASTEXITCODE -ne 0 -or $old -notmatch '^D:') { throw "could not read permissions: $old" }
-        if ($old.Contains($acctSid)) { Good "$t - already set"; Mark $t 'Services' 'OK'; continue }
-
-        $backup = Join-Path $BackupDir ("scmanager-{0}.txt" -f ($t -split '\.')[0])
-        if (-not (Test-Path $backup)) { Set-Content -Path $backup -Value $old -Encoding ASCII }
-
-        $idx = $old.IndexOf('S:')
-        $new = if ($idx -ge 0) { $old.Insert($idx, $scmAce) } else { $old + $scmAce }
-        $res = & sc.exe "\\$t" sdset scmanager $new
-        if ($LASTEXITCODE -ne 0) { throw "sdset failed: $res" }
-        Good "$t - read access granted (backup: $backup)"; Mark $t 'Services' 'OK'
+        $r = Invoke-Command -ComputerName $t -ErrorAction Stop -ScriptBlock $scmBlock -ArgumentList $acctSid
+        if ($r[0] -eq 'already') { Good "$t - already set" }
+        else {
+            $copy = Join-Path $BackupDir ("scmanager-{0}.txt" -f ($t -split '\.')[0])
+            if (-not (Test-Path $copy)) { Set-Content -Path $copy -Value $r[1] -Encoding ASCII }
+            Good "$t - read access granted (backup on the server: C:\ProgramData\Netwatch\scmanager-backup.txt)"
+        }
+        Mark $t 'Services' 'OK'
     } catch { Warn "$t - $($_.Exception.Message)"; Mark $t 'Services' 'FAILED' }
 }
 
