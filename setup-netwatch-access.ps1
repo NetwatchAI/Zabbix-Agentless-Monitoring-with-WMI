@@ -171,12 +171,12 @@ $others = @(@($dcs) + @($allMembers) | Where-Object { $_ -ne $thisDc })
 if ($others.Count -eq 0) {
     Good 'no other servers in the domain'
 } else {
-    if ($rulesChanged) {
-        Info "pushing policy to $($others.Count) other server(s)..."
-        foreach ($o in $others) {
-            try { Invoke-GPUpdate -Computer $o -Force -RandomDelayInMinutes 0 -ErrorAction Stop | Out-Null } catch { }
-        }
-    }
+    # gpupdate through WinRM, on all servers in parallel. Invoke-GPUpdate uses RPC,
+    # which the Netwatch rules only allow from the Watchnode.
+    Info "refreshing Group Policy on $($others.Count) other server(s)..."
+    Invoke-Command -ComputerName $others -ErrorAction SilentlyContinue -ScriptBlock {
+        gpupdate /target:computer /force | Out-Null
+    } | Out-Null
     Info "verifying $($others.Count) other server(s), waiting up to $VerifyTimeoutSeconds s..."
 
     function Test-ServerReady([string]$Computer) {
@@ -239,26 +239,22 @@ Step '3/5 WMI permissions (Root namespace, inherited)'
 # the Netwatch firewall rules, which only allow the Watchnode.
 $wmiBlock = {
     param($sid)
-    $wantMask = 0x21                     # Enable Account + Remote Enable
+    # Raw SDDL (GetSD/SetSD): never resolves account names, so entries left by
+    # deleted accounts cannot make it fail. CC = Enable Account, WP = Remote Enable,
+    # CI = inherited by child namespaces.
     $sys = @{ Namespace = 'root'; Path = '__SystemSecurity=@'; ErrorAction = 'Stop' }
-    $out = Invoke-WmiMethod @sys -Name GetSecurityDescriptor
-    if ($out.ReturnValue -ne 0) { throw "GetSecurityDescriptor returned $($out.ReturnValue)" }
-    $sd = $out.Descriptor
-    $already = $sd.DACL | Where-Object {
-        $_.Trustee.SIDString -eq $sid -and $_.AceType -eq 0 -and
-        (($_.AccessMask -band $wantMask) -eq $wantMask) -and (($_.AceFlags -band 0x2) -ne 0)
-    }
-    if ($already) { return 'already' }
-    $trustee = ([wmiclass]'Win32_Trustee').CreateInstance()
-    $trustee.SIDString = $sid
-    $ace = ([wmiclass]'Win32_ACE').CreateInstance()
-    $ace.AccessMask = $wantMask
-    $ace.AceFlags   = 0x2                # inherited by child namespaces
-    $ace.AceType    = 0
-    $ace.Trustee    = $trustee
-    $sd.DACL += $ace.psobject.ImmediateBaseObject
-    $res = Invoke-WmiMethod @sys -Name SetSecurityDescriptor -ArgumentList $sd.psobject.ImmediateBaseObject
-    if ($res.ReturnValue -ne 0) { throw "SetSecurityDescriptor returned $($res.ReturnValue)" }
+    $out = Invoke-WmiMethod @sys -Name GetSD
+    if ($out.ReturnValue -ne 0) { throw "GetSD returned $($out.ReturnValue)" }
+    $sddl = (New-Object System.Security.AccessControl.RawSecurityDescriptor($out.SD, 0)).GetSddlForm('All')
+    $ace  = "(A;CI;CCWP;;;$sid)"
+    if ($sddl.Contains($ace)) { return 'already' }
+    $d = $sddl.IndexOf('D:'); $sacl = $sddl.IndexOf('S:', [Math]::Max($d, 0))
+    $newSddl = if ($sacl -ge 0) { $sddl.Insert($sacl, $ace) } else { $sddl + $ace }
+    $raw   = New-Object System.Security.AccessControl.RawSecurityDescriptor($newSddl)
+    $bytes = New-Object byte[] ($raw.BinaryLength)
+    $raw.GetBinaryForm($bytes, 0)
+    $res = Invoke-WmiMethod @sys -Name SetSD -ArgumentList (,$bytes)
+    if ($res.ReturnValue -ne 0) { throw "SetSD returned $($res.ReturnValue)" }
     'set'
 }
 foreach ($t in $targets) {
