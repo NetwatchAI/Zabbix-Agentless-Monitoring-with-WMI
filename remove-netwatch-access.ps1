@@ -8,6 +8,8 @@
   .\remove-netwatch-access.ps1 -MonitoringAccount S-1-5-21-...   # account already deleted: clean up by SID
 
   Audit policy is left as it is: other tools may rely on it.
+
+  Each run is logged to C:\Temp\netwatch_wmi_remove.log (change with -LogFile).
 #>
 #Requires -Version 5.1
 [CmdletBinding()]
@@ -18,15 +20,28 @@ param(
 
     [switch]$DeleteAccount,
 
-    [string]$GpoName = 'Netwatch Monitoring - Firewall'
+    [string]$GpoName = 'Netwatch Monitoring - Firewall',
+
+    [string]$LogFile = "$env:SystemDrive\Temp\netwatch_wmi_remove.log"
 )
 
 $ErrorActionPreference = 'Stop'
 
+# Transcript log of everything shown on screen, appended per run, to help review failures
+$logDir = Split-Path -Parent $LogFile
+if ($logDir -and -not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory -Force | Out-Null }
+Start-Transcript -Path $LogFile -Append | Out-Null
+Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $env:COMPUTERNAME - Netwatch WMI removal started"
+
 function Step($m) { Write-Host ''; Write-Host "==> $m" -ForegroundColor Blue }
 function Good($m) { Write-Host "    OK   $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "    WARN $m" -ForegroundColor Yellow }
-function Die($m)  { Write-Host ''; Write-Host "ERROR: $m" -ForegroundColor Red; exit 1 }
+function Die($m)  { Write-Host ''; Write-Host "ERROR: $m" -ForegroundColor Red; Stop-Log 'stopped with an error'; exit 1 }
+function Stop-Log($result) {
+    Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $env:COMPUTERNAME - $result. Log: $LogFile"
+    try { Stop-Transcript | Out-Null } catch { }
+}
+trap { Write-Host "ERROR: $_" -ForegroundColor Red; Stop-Log 'stopped with an unexpected error'; break }
 
 $Report = [ordered]@{}
 function Mark($server, $step, $status) {
@@ -186,3 +201,4 @@ $rows | Format-Table -AutoSize | Out-String | Write-Host
 $failed = @($Report.Values | ForEach-Object { $_.Values } | Where-Object { $_ -like 'FAILED*' })
 if ($failed.Count -eq 0) { Write-Host 'DONE. Netwatch access has been removed from this domain.' -ForegroundColor Green }
 else { Write-Host "DONE WITH $($failed.Count) FAILED STEP(S). Re-running is safe." -ForegroundColor Yellow }
+Stop-Log $(if ($failed.Count) { "finished with $($failed.Count) failed step(s)" } else { 'finished successfully' })
